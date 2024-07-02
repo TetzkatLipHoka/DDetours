@@ -30,6 +30,10 @@ unit DDetours;
 {$WARN 5028 OFF}
 {$WARN 5057 OFF}
 {$WARN 5058 OFF}
+{$ELSE}
+{$WARN UNSAFE_CAST OFF}
+{$WARN UNSAFE_CODE OFF}
+{$WARN UNSAFE_TYPE OFF}
 {$ENDIF FPC}
 
 interface
@@ -119,7 +123,6 @@ function GetCreatorThreadIdFromTrampoline(var TrampoLine): TThreadId;
 function GetTrampolineParam(var TrampoLine): Pointer;
 
 {$IFDEF SUPPORTS_GENERICS}
-
 type
   IIntercept<T, U> = interface(IInterface)
     ['{EECBF3C2-3938-4923-835A-B0A6AD27744D}']
@@ -173,7 +176,52 @@ type
   end;
 {$ENDIF SUPPORTS_GENERICS}
 
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 type
+  IMAGE_DELAYLOAD_DESCRIPTOR = record
+        case longint of
+        0: (AllAttributes,
+            DllNameRVA,                       // RVA to the name of the target library (NULL-terminate ASCII string)
+            ModuleHandleRVA,                  // RVA to the HMODULE caching location (PHMODULE)
+            ImportAddressTableRVA,            // RVA to the start of the IAT (PIMAGE_THUNK_DATA)
+            ImportNameTableRVA,               // RVA to the start of the name table (PIMAGE_THUNK_DATA::AddressOfData)
+            BoundImportAddressTableRVA,       // RVA to an optional bound IAT
+            UnloadInformationTableRVA,        // RVA to an optional unload info table
+            TimeDateStamp         : Cardinal; // 0 if not bound,
+                                             // Otherwise, date/time of the target DLL
+         );
+        1: ( Attributes: Cardinal );
+//        1: (Attributes:bitpacked record
+//             rvabased:0..1;  {1 bits}                 // Delay load version 2
+//             ReservedAttributes: 0..$7FFFFFF; {31 bits}
+//             end;)
+     end;
+  PIMAGE_DELAYLOAD_DESCRIPTOR = ^IMAGE_DELAYLOAD_DESCRIPTOR;
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+function FindImportLibrary(hModule: THandle; pLibName: PAnsiChar): PPointer;
+function FindImportFunction(pLibrary: PPointer; pFunction: Pointer): PPointer;
+function HookImportFunction(pLibrary: PPointer; pFunction: Pointer; pNewFunction: Pointer): Pointer; overload;
+function HookImportFunctionByName(hModule: THandle; pLibName: PAnsiChar; pFunction: PAnsiChar; pNewFunction: Pointer): Pointer; overload;
+function HookImportFunction(hModule: THandle; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer): Pointer; overload;
+function HookImportFunctionByName(pModule: PAnsiChar; pLibName: PAnsiChar; pFunction: PAnsiChar; pNewFunction: Pointer): Pointer; overload;
+function HookImportFunction(pModule: PAnsiChar; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer): Pointer; overload;
+
+function FindDelayImportLibrary(hModule: THandle; pLibName: PAnsiChar): Pointer;
+function FindDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; pFuncName: PAnsiChar): PPointer; overload;
+function FindDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; Ordinal: Word): PPointer; overload;
+function HookDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; pFuncName: PAnsiChar; pNewFunction: Pointer) : Pointer; overload;
+function HookDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; Ordinal: Word; pNewFunction: Pointer) : Pointer; overload;
+
+function FindDelayImportFunction(hModule: THandle; DllName: PAnsiChar; pFuncName: PAnsiChar): PPointer; overload;
+function FindDelayImportFunction(hModule: THandle; DllName: PAnsiChar; Ordinal: Word): PPointer; overload;
+function HookDelayImportFunction(hModule: THandle; DllName: PAnsiChar; pFuncName: PAnsiChar; pNewFunction: Pointer) : Pointer; overload;
+function HookDelayImportFunction(hModule: THandle; DllName: PAnsiChar; Ordinal: Word; pNewFunction: Pointer) : Pointer; overload;
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+type
+  TDefaultConstructor = function(InstanceOrVMT: Pointer; Alloc: ShortInt; Arg: Integer): Pointer;
+
   DetourException = Exception;
 
 implementation
@@ -2750,8 +2798,321 @@ constructor TIntercept<T>.Create(const TargetProc, InterceptProc: T; const APara
 begin
   inherited Create(TargetProc, InterceptProc, AParam, InterceptOptions);
 end;
-
 {$ENDIF SUPPORTS_GENERICS}
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{$IFDEF Win64}
+function IMAGE_SNAP_BY_ORDINAL( Ordinal : UInt64 ) : Boolean;
+const
+  IMAGE_ORDINAL_FLAG64 = $8000000000000000;
+begin
+  result := ( ( Ordinal AND IMAGE_ORDINAL_FLAG64 ) <> 0 );
+end;
+{$ELSE}
+function IMAGE_SNAP_BY_ORDINAL( Ordinal : Cardinal ) : Boolean;
+const
+  IMAGE_ORDINAL_FLAG32 = $80000000;
+begin
+  result := ( ( Ordinal AND IMAGE_ORDINAL_FLAG32 ) <> 0 );
+end;
+{$ENDIF}
+
+function IMAGE_ORDINAL( Ordinal : Cardinal ) : Cardinal;
+begin
+  result := Ordinal AND $ffff;
+end;
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+function PatchImportFunction(pCallbackFunction: PPointer; pNewFunction: Pointer): Pointer;
+var
+  dwOldProtect: Cardinal;
+begin
+  if InternalFuncs.VirtualProtect(pCallbackFunction, SizeOf(Pointer), PAGE_READWRITE, dwOldProtect) then
+    begin
+    Result := pCallbackFunction^;
+    pCallbackFunction^ := pNewFunction;
+    InternalFuncs.VirtualProtect(pCallbackFunction, SizeOf(Pointer), dwOldProtect, dwOldProtect);
+    end
+  else
+    result := nil;
+end;
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+function FindImageDirectory(hModule: THandle; Index: Integer; out DataDir: PImageDataDirectory): Pointer;
+var
+  pNTHeaders: PImageNtHeaders;
+  pModule: PAnsiChar absolute hModule;
+  pDosHeader: PImageDosHeader absolute hModule;
+begin
+  if pDosHeader^.e_magic = IMAGE_DOS_SIGNATURE then
+  begin
+    pNTHeaders := @pModule[pDosHeader^._lfanew];
+    if pNTHeaders^.Signature = IMAGE_NT_SIGNATURE then
+    begin
+      DataDir := @pNTHeaders^.OptionalHeader.DataDirectory[Index];
+      Result := @pModule[DataDir^.VirtualAddress];
+      Exit;
+    end;
+  end;
+  Result := nil;
+end;
+
+function FindImportLibrary(hModule: THandle; pLibName: PAnsiChar): PPointer;
+{$IF NOT Declared( PIMAGE_IMPORT_DESCRIPTOR )}
+type
+  _IMAGE_IMPORT_DESCRIPTOR = record
+    case Byte of
+      0: (Characteristics: DWORD);          // 0 for terminating null import descriptor
+      1: (OriginalFirstThunk: DWORD;        // RVA to original unbound IAT (PIMAGE_THUNK_DATA)
+          TimeDateStamp: DWORD;             // 0 if not bound,
+                                            // -1 if bound, and real date\time stamp
+                                            //     in IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT (new BIND)
+                                            // O.W. date/time stamp of DLL bound to (Old BIND)
+
+          ForwarderChain: DWORD;            // -1 if no forwarders
+          Name: DWORD;
+          FirstThunk: DWORD);                // RVA to IAT (if bound this IAT has actual addresses)
+  end;
+  PIMAGE_IMPORT_DESCRIPTOR = ^_IMAGE_IMPORT_DESCRIPTOR;
+{$IFEND}
+var
+  pEnd: PByte;
+  pImpDir: PImageDataDirectory;
+  pImpDesc: PIMAGE_IMPORT_DESCRIPTOR;
+  pModule: PAnsiChar absolute hModule;
+begin
+  pImpDesc := FindImageDirectory(hModule, IMAGE_DIRECTORY_ENTRY_IMPORT, pImpDir);
+  if pImpDesc = nil then
+    begin
+    result := nil;
+    Exit;
+    end;
+
+  pEnd := PByte( PAnsiChar(pImpDesc) + pImpDir^.Size );
+
+  while (PAnsiChar(pImpDesc) < pEnd) and (pImpDesc^.FirstThunk <> 0) do
+  begin
+    if lstrcmpiA(@pModule[pImpDesc^.Name], pLibName) = 0 then
+    begin
+      Result := @pModule[pImpDesc^.FirstThunk];
+      Exit;
+    end;
+    Inc(pImpDesc);
+  end;
+  Result := nil;
+end;
+
+function FindImportFunction(pLibrary: PPointer; pFunction: Pointer): PPointer;
+begin
+  while (pLibrary^ <> nil) do
+  begin
+    if pLibrary^ = pFunction then
+      begin
+      result := pLibrary;
+      Exit;
+      end;
+    Inc(pLibrary);
+  end;
+  Result := nil;
+end;
+
+function HookImportFunction(pLibrary: PPointer; pFunction: Pointer; pNewFunction: Pointer): Pointer;
+begin
+  Result := FindImportFunction( pLibrary, pFunction );
+  if (Result <> nil) then
+    Result := PatchImportFunction( Result, pNewFunction );
+end;
+
+function HookImportFunctionByName(hModule: THandle; pLibName: PAnsiChar; pFunction: PAnsiChar; pNewFunction: Pointer): Pointer;
+begin
+  result := FindImportLibrary( hModule, pLibName );
+  if ( result <> nil ) then
+    begin
+    hModule := GetModuleHandleA( pLibName );
+    result := HookImportFunction( result, GetProcAddress( hModule, pFunction ), pNewFunction );
+    end;
+end;
+
+function HookImportFunction(hModule: THandle; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer): Pointer;
+begin
+  result := FindImportLibrary( hModule, pLibName );
+  if ( result <> nil ) then
+    result := HookImportFunction( result, pFunction, pNewFunction );
+end;
+
+function HookImportFunctionByName(pModule: PAnsiChar; pLibName: PAnsiChar; pFunction: PAnsiChar; pNewFunction: Pointer): Pointer;
+var
+  hModule: THandle;
+begin
+  result := FindImportLibrary( GetModuleHandleA( pModule ), pLibName );
+  if ( result <> nil ) then
+    begin
+    hModule := GetModuleHandleA( pLibName );
+    result := HookImportFunction( result, GetProcAddress( hModule, pFunction ), pNewFunction );
+    end;
+end;
+
+function HookImportFunction(pModule: PAnsiChar; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer): Pointer;
+begin
+  result := FindImportLibrary( GetModuleHandleA( pModule ), pLibName );
+  if ( result <> nil ) then
+    result := HookImportFunction( result, pFunction, pNewFunction );
+end;
+
+function FindDelayImportLibrary(hModule: THandle; pLibName: PAnsiChar): Pointer;
+{$IF NOT Declared( IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT )}
+const
+  IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13;  { Delay Load Import Descriptors }
+{$IFEND}
+var
+  pEnd: PByte;
+  pImpDir: PImageDataDirectory;
+  pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR;
+  pModule: PAnsiChar absolute hModule;
+begin
+  pImpDesc := FindImageDirectory(hModule, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, pImpDir);
+  if pImpDesc = nil then
+    begin
+    result := nil;
+    Exit;
+    end;
+
+  pEnd := PByte( PAnsiChar(pImpDesc) + pImpDir^.Size );
+
+  while (PAnsiChar(pImpDesc) < pEnd) and (pImpDesc^.DllNameRVA > 0) do
+    begin
+    if lstrcmpiA(@pModule[pImpDesc^.DllNameRVA], pLibName) = 0 then
+      begin
+      result := pImpDesc;
+      Exit;
+      end;
+
+    Inc(pImpDesc);
+    end;
+  Result := nil;
+end;
+
+{$IF NOT Declared( PIMAGE_THUNK_DATA )}
+type
+  _IMAGE_THUNK_DATA32 = record
+    case Byte of
+      0: (ForwarderString: DWORD); // PBYTE
+      1: (_Function: DWORD);       // PDWORD Function -> _Function
+      2: (Ordinal: DWORD);
+      3: (AddressOfData: DWORD);   // PIMAGE_IMPORT_BY_NAME
+  end;
+  PIMAGE_THUNK_DATA32 = ^_IMAGE_THUNK_DATA32;
+  PIMAGE_THUNK_DATA = PIMAGE_THUNK_DATA32;
+{$IFEND}
+
+function FindDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; pFuncName: PAnsiChar): PPointer;
+{$IF NOT Declared( PIMAGE_IMPORT_BY_NAME )}
+type
+  _IMAGE_IMPORT_BY_NAME = record
+    Hint: Word;
+    Name: array[0..0] of Byte;
+  end;
+  PIMAGE_IMPORT_BY_NAME = ^_IMAGE_IMPORT_BY_NAME;
+{$IFEND}
+var
+  pImpName: PIMAGE_IMPORT_BY_NAME;
+  pImgThunkName: PIMAGE_THUNK_DATA;
+  pImgThunkAddr: PIMAGE_THUNK_DATA;
+  pModule: PAnsiChar absolute hModule;
+begin
+  pImgThunkName:= @pModule[pImpDesc^.ImportNameTableRVA];
+  pImgThunkAddr:= @pModule[pImpDesc^.ImportAddressTableRVA];
+
+  while (pImgThunkName^.Ordinal <> 0) do
+  begin
+    if not (IMAGE_SNAP_BY_ORDINAL(pImgThunkName^.Ordinal)) then
+    begin
+      pImpName:= @pModule[pImgThunkName^.AddressOfData];
+      if (lstrcmpiA( PAnsiChar( @pImpName^.Name[ 0 ] ), pFuncName) = 0) then
+        begin
+        result := PPointer(@pImgThunkAddr^._Function);
+        Exit;
+        end;
+    end;
+    Inc(pImgThunkName);
+    Inc(pImgThunkAddr);
+  end;
+  Result:= nil;
+end;
+
+function FindDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; Ordinal: Word): PPointer;
+var
+  pImgThunkName: PIMAGE_THUNK_DATA;
+  pImgThunkAddr: PIMAGE_THUNK_DATA;
+  pModule: PAnsiChar absolute hModule;
+begin
+  pImgThunkName:= @pModule[pImpDesc^.ImportNameTableRVA];
+  pImgThunkAddr:= @pModule[pImpDesc^.ImportAddressTableRVA];
+
+  while (pImgThunkName^.Ordinal <> 0) do
+  begin
+    if IMAGE_SNAP_BY_ORDINAL(pImgThunkName.Ordinal) and (IMAGE_ORDINAL(pImgThunkName.Ordinal) = ordinal) then
+      begin
+      result := PPointer(@pImgThunkAddr^._Function);
+      Exit;
+      end;
+    Inc(pImgThunkName);
+    Inc(pImgThunkAddr);
+  end;
+  Result:= nil;
+end;
+
+function HookDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; pFuncName: PAnsiChar; pNewFunction: Pointer) : Pointer;
+begin
+  Result := FindDelayImportFunction(hModule, pImpDesc, pFuncName);
+  if (Result <> nil) then
+    Result := PatchImportFunction(Result, pNewFunction);
+end;
+
+function HookDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; Ordinal: Word; pNewFunction: Pointer) : Pointer;
+begin
+  Result := FindDelayImportFunction(hModule, pImpDesc, Ordinal);
+  if (Result <> nil) then
+    Result := PatchImportFunction(Result, pNewFunction);
+end;
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+function FindDelayImportFunction(hModule: THandle; DllName: PAnsiChar; pFuncName: PAnsiChar): PPointer;
+var
+  pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR;
+begin
+  pImpDesc := FindDelayImportLibrary(hModule, DllName);
+  if (pImpDesc <> nil) then
+    result := FindDelayImportFunction(hModule, pImpDesc, pFuncName)
+  else
+    result := nil;
+end;
+
+function FindDelayImportFunction(hModule: THandle; DllName: PAnsiChar; Ordinal: Word): PPointer;
+var
+  pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR;
+begin
+  pImpDesc := FindDelayImportLibrary(hModule, DllName);
+  if (pImpDesc <> nil) then
+    result := FindDelayImportFunction(hModule, pImpDesc, Ordinal)
+  else
+    result := nil;
+end;
+
+function HookDelayImportFunction(hModule: THandle; DllName: PAnsiChar; pFuncName: PAnsiChar; pNewFunction: Pointer) : Pointer;
+begin
+  Result := FindDelayImportFunction(hModule, DllName, pFuncName);
+  if (Result <> nil) then
+    Result := PatchImportFunction(Result, pNewFunction);
+end;
+
+function HookDelayImportFunction(hModule: THandle; DllName: PAnsiChar; Ordinal: Word; pNewFunction: Pointer) : Pointer;
+begin
+  Result := FindDelayImportFunction(hModule, DllName, Ordinal);
+  if (Result <> nil) then
+    Result := PatchImportFunction(Result, pNewFunction);
+end;
+
 { ======================================= Initialization ======================================= }
 
 procedure InitInternalFuncs();

@@ -1991,21 +1991,7 @@ begin
   while Sb < JmpSize do
   begin
     if Inst.OpType = otRET then
-      begin
-      Inst.Addr := Inst.NextInst;
-      fDecodeInst(@Inst);
-
-      while ( ( Inst.OpCode = otNOP ) OR ( Inst.OpCode = otINT3 ) ) AND ( Sb < JmpSize ) do
-        begin
-        Inc(Sb, Inst.InstSize);
-        Inst.Addr := Inst.NextInst;
-        fDecodeInst(@Inst);
-        end;
-
-      if ( Sb < JmpSize ) then
-        raise InterceptException.Create(SErrorSmallFunctionSize);
-      Break;
-      end;
+      raise InterceptException.Create(SErrorSmallFunctionSize);
     Inst.Addr := Inst.NextInst;
     Inc(Sb, fDecodeInst(@Inst));
   end;

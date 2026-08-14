@@ -2207,7 +2207,12 @@ begin
     { Valid only for CRC32 instruction ! }
     if (PInst^.NextInst^ = $F0) or (PInst^.NextInst^ = $F1) then
     begin
-      Decode_NA_ModRm(PInst);
+      { NOT Decode_NA_ModRm: that one rejects anything with a mandatory prefix,
+        and CRC32 is defined WITH one ($F2). The validity check has already
+        been done above, so decode the ModRm directly - otherwise the ModRm and
+        displacement are never consumed and InstSize comes out far too short. }
+      SetOpCode(PInst);
+      Decode_ModRm(PInst);
       Exit;
     end
     else
@@ -2248,7 +2253,10 @@ begin
       Exit;
     end;
   end;
-  Decode_NA_ModRm(PInst);
+  { Same reasoning as above: the opcodes reaching this point are valid with a
+    mandatory prefix ($66/$F2/$F3), which Decode_NA_ModRm would refuse. }
+  SetOpCode(PInst);
+  Decode_ModRm(PInst);
 end;
 
 procedure Decode_66_ModRm_Ib(PInst: PInstruction);

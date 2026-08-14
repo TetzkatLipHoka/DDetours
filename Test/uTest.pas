@@ -46,6 +46,14 @@ var
 
   FInterceptSub: TIntercept<TSub, Integer>;
 
+{ Optimization off for the functions being hooked: with it on, "Result := a - b"
+  compiles to about three bytes - smaller than the patch DDetours has to write,
+  which it rightfully refuses ("Size of function is too small, risk to override
+  others adjacent functions"). Without a stack frame these tests fail for a
+  reason that has nothing to do with what they check. }
+{$IFOPT O+}{$DEFINE OPT_WAS_ON}{$ENDIF}
+{$OPTIMIZATION OFF}
+
 function Add(a, b: Integer): Integer;
 begin
   Result := a + b;
@@ -60,6 +68,8 @@ function GetPi(): Extended;
 begin
   Result := Pi;
 end;
+
+{$IFDEF OPT_WAS_ON}{$OPTIMIZATION ON}{$UNDEF OPT_WAS_ON}{$ENDIF}
 
 function InterceptAdd(a, b: Integer): Integer;
 begin

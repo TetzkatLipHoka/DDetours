@@ -11,7 +11,8 @@ uses
   DUnitX.Loggers.Console,
   DUnitX.Loggers.Xml.NUnit,
   DUnitX.TestFramework,
-  uTest in 'uTest.pas';
+  uTest in 'uTest.pas',
+  uTestRipDisp in 'uTestRipDisp.pas';
 
 var
   runner : ITestRunner;

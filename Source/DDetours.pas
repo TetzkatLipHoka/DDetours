@@ -1013,28 +1013,36 @@ begin
   }
   Result := 0;
   FillChar(P^, MAX_INST_LENGTH_N, $90);
-  nPrfs := GetPrefixesCount(PInst^.Prefixes);
+  { Prf_Vex2 and Prf_Vex3 both carry the shared Prf_VEX bit, so they must never
+    be tested with "and <> 0" - that also matches the other VEX form. Mask them
+    out of the prefix count and add the VEX bytes explicitly below. }
+  nPrfs := GetPrefixesCount(PInst^.Prefixes and not(Prf_Vex2 or Prf_Vex3));
   Inc(Result, nPrfs);
   case PInst^.OpTable of
     tbTwoByte:
-      if PInst^.Prefixes and Prf_VEX3 = 0 then
-        Inc(Result); // $0F
+      if PInst^.Prefixes and Prf_VEX = 0 then
+        Inc(Result); // $0F  (under VEX the opcode map lives in the prefix)
     tbThreeByte:
       begin
-        if PInst^.Prefixes and Prf_VEX3 = 0 then
+        if PInst^.Prefixes and Prf_VEX = 0 then
           Inc(Result, 2); // 0F + 38|3A !
       end;
     tbFPU:
-      Inc(Result, 2); // [$D8..$D9] + ModRm !
+      Inc(Result, 2); // [$D8..$DF] escape + ModRm !
   end;
-  if PInst^.Prefixes and Prf_Vex2 <> 0 then
-    Inc(Result); // VEX.P0
-  if PInst^.Prefixes and Prf_VEX3 <> 0 then
-    Inc(Result, 2); // VEX.P0 + VEX.P1
-  if PInst^.OpKind = kGrp then
-    Inc(Result, 2) // Group + ModRm
-  else
-    Inc(Result); // OpCode
+  if PInst^.Prefixes and Prf_Vex3 = Prf_Vex3 then
+    Inc(Result, 3) // $C4 + VEX.P0 + VEX.P1
+  else if PInst^.Prefixes and Prf_Vex2 = Prf_Vex2 then
+    Inc(Result, 2); // $C5 + VEX.P0
+  { FPU instructions are an escape byte ($D8..$DF) + ModRm, and BOTH were
+    already counted above. Adding the opcode again here made the result one
+    (or, for a group, two) bytes too long: the caller then patched the ModRm
+    at the wrong offset and left the original rip-relative one in place. }
+  if PInst^.OpTable <> tbFPU then
+    if PInst^.OpKind = kGrp then
+      Inc(Result, 2) // Group + ModRm
+    else
+      Inc(Result); // OpCode
   if Assigned(P) then
     Move(PInst^.Addr^, P^, Result);
 end;
@@ -1393,10 +1401,13 @@ var
   Offset: Int64;
   P: PByte;
   rReg: Byte;
-  POpc: PByte;
+  POpc: array [0 .. MAX_INST_LENGTH_N - 1] of Byte;
   pMR: PByte;
   pFrst: PByte;
+  pCopy: PByte;
   L: ShortInt;
+  ImmSize: Integer;
+  k: Integer;
 begin
   pFrst := NewAddr;
   P := PInst^.NextInst;
@@ -1413,14 +1424,28 @@ begin
   P := PByte(Int64(P) + Int64(PInst^.Disp.Value));
 
   Offset := Int64(Int64(P) - Int64(NewAddr) - PInst^.InstSize);
-  if Int32(Offset) <> Offset then
+  { DDETOURS_FORCE_ABSRIP routes EVERY rip-relative instruction through the
+    absolute-address path below, which is otherwise only taken when the
+    trampoline lands further than 2 GB away - handy to regression-test that
+    rarely reached branch. }
+  if {$IFDEF DDETOURS_FORCE_ABSRIP}True or {$ENDIF}(Int32(Offset) <> Offset) then
   begin
-    rReg := rEAX;
+    { Scratch register that will hold the absolute address.
+      Deliberately NOT (R|E)AX/CX/DX/BX: those are read or written IMPLICITLY by
+      instructions that can carry a rip-relative memory operand - MUL, IMUL
+      (one operand form), DIV, IDIV and CMPXCHG use (R|E)AX (and DX),
+      CMPXCHG8B/16B additionally BX and CX. Borrowing such a register silently
+      corrupts the operation, e.g.
+        MUL qword ptr [rip+disp32]  ->  MOV RAX,<abs> / MUL [RAX]
+      would multiply by the address instead of the intended value.
+      (R|E)SI/DI are only implicit for string instructions, and those carry no
+      ModRm/displacement, so they are always safe here. }
+    rReg := rESI;
     if PInst^.ModRm.Flags and mfUsed <> 0 then
     begin
       Assert(PInst^.Disp.Flags and dfRip <> 0);
       if PInst^.ModRm.Reg = rReg then
-        rReg := rECX;
+        rReg := rEDI;
 
       { PUSH UsedReg }
       PByte(NewAddr)^ := $50 + (rReg and $7);
@@ -1437,10 +1462,22 @@ begin
       Inc(NewAddr, SizeOf(NativeInt));
 
       { Set the original instruction opcodes }
-      POpc := GetMemory(MAX_INST_LENGTH_N);
-      L := GetInstOpCodes(PInst, POpc);
+      L := GetInstOpCodes(PInst, @POpc[0]);
 
-      Move(POpc^, NewAddr^, L);
+      pCopy := NewAddr;
+      Move(POpc[0], NewAddr^, L);
+      { The rm field below names a REAL register now (RSI/RDI, both < R8). A
+        REX.B carried over from the original encoding would silently turn
+        [RSI] into [R14], so clear it. REX is the last prefix before the
+        opcode and the only prefix byte in the $40..$4F range. }
+      if PInst^.Prefixes and Prf_Rex <> 0 then
+        for k := 0 to L - 1 do
+          if (PByte(NativeInt(pCopy) + k)^ >= $40) and
+             (PByte(NativeInt(pCopy) + k)^ <= $4F) then
+          begin
+            PByte(NativeInt(pCopy) + k)^ := PByte(NativeInt(pCopy) + k)^ and (not $01);
+            Break;
+          end;
       Inc(NewAddr, L);
       pMR := NewAddr;
       if (PInst^.OpKind and kGrp <> 0) or (PInst^.OpTable = tbFPU) then
@@ -1450,11 +1487,29 @@ begin
       Inc(pMR);
       NewAddr := pMR;
 
+      { GetInstOpCodes only returns prefixes + opcode (+ ModRm for groups), so
+        any immediate of the original instruction is still missing here. Without
+        it the CPU would read the following POP byte as the immediate and run
+        off the rails, e.g.
+          SUB dword ptr [rip+disp32], 1   ->   SUB dword ptr [rReg], <POP>
+        The immediate is always the last field of an instruction, so copy it
+        from the tail of the original. }
+      ImmSize := 0;
+      if PInst^.Imm.Flags and imfUsed <> 0 then
+        Inc(ImmSize, PInst^.Imm.Size);
+      if PInst^.ImmEx.Flags and imfUsed <> 0 then
+        Inc(ImmSize, PInst^.ImmEx.Size);
+      if ImmSize > 0 then
+      begin
+        Move(PByte(NativeInt(PInst^.Addr) + PInst^.InstSize - ImmSize)^,
+             NewAddr^, ImmSize);
+        Inc(NewAddr, ImmSize);
+      end;
+
       { POP UsedReg }
       PByte(NewAddr)^ := $58 + (rReg and $7);
       Inc(NewAddr);
 
-      FreeMemory(POpc);
       Result := (NativeInt(NewAddr) - NativeInt(pFrst));
       Exit;
     end
@@ -1463,7 +1518,19 @@ begin
   end;
   Move(PInst^.Addr^, NewAddr^, PInst^.InstSize);
   Inc(NewAddr, PInst^.InstSize);
-  PInt32(NativeInt(NewAddr) - SizeOf(Int32))^ := Int32(Offset);
+  { The displacement is NOT always the last field of the instruction: if an
+    immediate follows, the disp32 sits BEFORE it. Writing the corrected
+    displacement blindly into the last 4 bytes corrupts both the displacement
+    and the immediate.
+    Example (Delphi x64 unit initialization):
+      83 2D <disp32> 01   SUB dword ptr [rip+disp32], 1
+    So step back over the immediate(s) first. }
+  ImmSize := 0;
+  if PInst^.Imm.Flags and imfUsed <> 0 then
+    Inc(ImmSize, PInst^.Imm.Size);      { ops8/16/32/64bits = 1/2/4/8 bytes }
+  if PInst^.ImmEx.Flags and imfUsed <> 0 then
+    Inc(ImmSize, PInst^.ImmEx.Size);
+  PInt32(NativeInt(NewAddr) - ImmSize - SizeOf(Int32))^ := Int32(Offset);
 
   Result := PInst^.InstSize;
 end;

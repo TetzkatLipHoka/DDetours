@@ -63,10 +63,73 @@ type
     [Test] procedure OpcodeMap_Vex3;
   end;
 
+  {
+    A function that branches back into the bytes an inline patch would occupy
+    cannot be hooked at all - relocation does not help, because the jump goes
+    to an address that no longer holds the original code. DDetours has to
+    refuse such a target instead of corrupting it.
+
+    Found in the wild in Vcl.Imaging.pngimage.TPngImage.InitializeGamma:
+
+        xor  edx, edx              ; +0
+        mov  ecx, edx              ; +2   <- loop target
+        ...
+        jne  -22                   ; back to +2
+        ret
+
+    A 5 byte patch at +0 swallows the target; the first iteration runs the
+    JMP, the second one executes its displacement as code. The process then
+    dies somewhere unrelated - here it read the NOP padding as a pointer.
+  }
+  [TestFixture]
+  TPatchAreaTests = class(TObject)
+  public
+    // loop target inside the patch -> must be refused
+    [Test] procedure LoopIntoPatchArea_IsRefused;
+    // same shape but the loop starts past the patch -> must still hook
+    [Test] procedure LoopBeyondPatchArea_IsHooked;
+  end;
+
+  {
+    Import thunks: JMP dword/qword ptr [slot].
+
+    Delphi emits one of these per imported API (System.GetCurrentThreadId,
+    System.ExitProcess, ...) - 6 bytes of jump plus 2 bytes of padding. They
+    are attractive hook targets because they are the funnel for every call to
+    that API, and a profiler that instruments everything hits thousands of
+    them.
+
+    The whole thunk is a single instruction, so the patch swallows all of it
+    and the trampoline has to carry a working copy: absolute on x86,
+    rip-relative (and therefore relocated) on x64.
+  }
+  [TestFixture]
+  TImportThunkTests = class(TObject)
+  public
+    [Test] procedure ImportThunk_IsRelocated;
+  end;
+
+  {
+    Instruction length, checked straight at the decoder.
+
+    Some encodings cannot be produced portably from Delphi's inline assembler,
+    so they are fed to DecodeInst as raw bytes. A wrong length here is the
+    worst kind of defect: everything after the instruction shifts, the
+    trampoline is built from garbage, and the failure surfaces as an access
+    violation at an unrelated address.
+  }
+  [TestFixture]
+  TDecoderSizeTests = class(TObject)
+  public
+    [Test] procedure Moffs_OperandSizePrefix_DoesNotShrinkOffset;
+  end;
+
 implementation
 
 uses
-  DDetours;
+  System.SysUtils,
+  DDetours,
+  InstDecode;
 
 // Globals, so the compiler addresses them rip-relative (x64) / absolute (x86).
 var
@@ -194,6 +257,60 @@ asm
 {$ENDIF}
   vmovd   eax, xmm0
   db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
+end;
+
+// Loop target at +2, i.e. inside any inline patch (5 bytes on x86, up to 14 on
+// x64). This must be refused.
+function LoopIntoPatchArea: Integer;
+asm
+        xor     edx, edx           // +0, 2 bytes
+@@loop:                            // +2  <- inside the patch
+        inc     edx
+        cmp     edx, 16
+        jne     @@loop
+{$IFDEF CPUX64}
+        mov     eax, edx
+{$ELSE}
+        mov     eax, edx
+{$ENDIF}
+        db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
+end;
+
+// Same loop, but three 5-byte MOVs push its target to +15 - past the patch on
+// both architectures. Guards the check against false positives.
+function LoopBeyondPatchArea: Integer;
+asm
+        mov     eax, $11111111     // +0,  5 bytes
+        mov     eax, $22222222     // +5,  5 bytes
+        mov     eax, $33333333     // +10, 5 bytes
+        xor     edx, edx           // +15
+@@loop:                            // +17 <- beyond the patch
+        inc     edx
+        cmp     edx, 16
+        jne     @@loop
+        mov     eax, edx
+        db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
+end;
+
+// The imported routine an import thunk would forward to.
+function ThunkTarget: Integer;
+begin
+  Result := 4711;
+end;
+
+var
+  GImportSlot: Pointer = @ThunkTarget;    // stands in for an IAT entry
+
+// JMP dword ptr [GImportSlot]  ->  FF 25 <abs32>   (x86)
+// JMP qword ptr [rip+disp]     ->  FF 25 <rel32>   (x64, needs relocation)
+function ImportThunk: Integer;
+asm
+{$IFDEF CPUX64}
+        jmp     qword ptr [rip + GImportSlot]
+{$ELSE}
+        jmp     dword ptr [GImportSlot]
+{$ENDIF}
+        db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
 end;
 
 type
@@ -328,8 +445,108 @@ begin
   CheckOpcodeMap(@VexThreeByteMul, 'VPMULLD [rip+d] (VEX3)');
 end;
 
+{ TPatchAreaTests }
+
+procedure TPatchAreaTests.LoopIntoPatchArea_IsRefused;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      InterceptCreate(@LoopIntoPatchArea, @DummyInt);
+    end,
+    Exception,
+    'a loop target inside the patch area must be refused, not patched');
+end;
+
+procedure TPatchAreaTests.LoopBeyondPatchArea_IsHooked;
+var
+  tr: Pointer;
+begin
+  tr := InterceptCreate(@LoopBeyondPatchArea, @DummyInt);
+  Assert.IsTrue(tr <> nil, 'refused a target whose loop is past the patch');
+  try
+    Assert.AreEqual(16, TIntFunc(tr)(), 'relocated prologue misbehaves');
+  finally
+    InterceptRemove(tr);
+  end;
+end;
+
+{ TImportThunkTests }
+
+procedure TImportThunkTests.ImportThunk_IsRelocated;
+var
+  tr: Pointer;
+begin
+  // Sanity: the thunk forwards correctly before anyone touches it.
+  Assert.AreEqual(4711, ImportThunk, 'thunk broken before hooking');
+
+  tr := InterceptCreate(@ImportThunk, @DummyInt);
+  Assert.IsTrue(tr <> nil, 'no trampoline for an import thunk');
+  try
+    // The hook belongs on the THUNK, not on whatever the slot happens to point
+    // at right now. Following the indirect jump would silently redirect every
+    // caller of the imported routine, process wide.
+    Assert.AreEqual(0, ImportThunk, 'calling the thunk did not reach the hook');
+    Assert.AreEqual(4711, ThunkTarget,
+      'the imported routine itself was hooked - GetRoot followed JMP [slot]');
+    Assert.AreEqual(4711, TIntFunc(tr)(),
+      'relocated JMP [slot] does not reach the imported routine');
+  finally
+    InterceptRemove(tr);
+  end;
+
+  Assert.AreEqual(4711, ImportThunk, 'thunk broken after unhooking');
+end;
+
+{ TDecoderSizeTests }
+
+function DecodedSize(const ABytes: array of Byte): Integer;
+var
+  Inst: TInstruction;
+  Buf: array [0 .. 31] of Byte;
+  i: Integer;
+begin
+  FillChar(Buf, SizeOf(Buf), $90);
+  for i := 0 to High(ABytes) do
+    Buf[i] := ABytes[i];
+  FillChar(Inst, SizeOf(TInstruction), #00);
+  Inst.Archi := {$IFDEF CPUX64}CPUX64{$ELSE}CPUX32{$ENDIF};
+  Inst.Options := DecodeVex;
+  Inst.Addr := @Buf[0];
+  Inst.VirtualAddr := nil;
+  Result := DecodeInst(@Inst);
+end;
+
+procedure TDecoderSizeTests.Moffs_OperandSizePrefix_DoesNotShrinkOffset;
+begin
+  // MOV moffs, (E)AX / MOV moffs, AX - the offset is an ADDRESS, so only the
+  // $67 address-size prefix may change its width. $66 selects AX over EAX and
+  // must leave the offset alone. Delphi emits the $66 form in System.Set8087CW.
+{$IFDEF CPUX64}
+  // 48 A3 <8 byte offset>          mov [moffs64], rax
+  Assert.AreEqual(10, DecodedSize([$48, $A3, 1, 2, 3, 4, 5, 6, 7, 8]),
+    'REX.W moffs64');
+  // 66 48 A3 <8 byte offset>       mov [moffs64], ax (REX.W wins the operand)
+  Assert.AreEqual(11, DecodedSize([$66, $48, $A3, 1, 2, 3, 4, 5, 6, 7, 8]),
+    'operand-size prefix shrank the moffs offset');
+  // 66 A3 <8 byte offset>          mov word ptr [moffs64], ax - no REX.W, so
+  // the old code took vOpSize = 2 and reported 3 bytes instead of 10.
+  Assert.AreEqual(10, DecodedSize([$66, $A3, 1, 2, 3, 4, 5, 6, 7, 8]),
+    'operand-size prefix shrank the moffs offset (no REX.W)');
+{$ELSE}
+  // A3 <4 byte offset>             mov [moffs32], eax
+  Assert.AreEqual(5, DecodedSize([$A3, $30, $90, $BF, $00]), 'plain moffs32');
+  // 66 A3 <4 byte offset>          mov word ptr [moffs32], ax
+  Assert.AreEqual(6, DecodedSize([$66, $A3, $30, $90, $BF, $00]),
+    'operand-size prefix shrank the moffs offset');
+{$ENDIF}
+end;
+
 initialization
 
 TDUnitX.RegisterTestFixture(TRipDispTests);
+TDUnitX.RegisterTestFixture(TPatchAreaTests);
+TDUnitX.RegisterTestFixture(TImportThunkTests);
+TDUnitX.RegisterTestFixture(TDecoderSizeTests);
 
 end.

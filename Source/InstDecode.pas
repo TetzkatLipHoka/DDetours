@@ -2385,10 +2385,40 @@ begin
   Decode_J(PInst, PInst^.LID.zOpSize);
 end;
 
+{
+  MOV AL/AX/EAX/RAX, moffs  and  MOV moffs, AL/AX/EAX/RAX  ($A0..$A3).
+
+  The moffs field is a plain absolute ADDRESS that follows the opcode - there
+  is no ModRm. Its width therefore depends on the ADDRESS size ($67 prefix),
+  never on the operand size ($66). Using vOpSize made
+
+      66 A3 30 90 BF 00      mov word ptr [$00BF9030], ax
+
+  decode as 4 bytes with a 2 byte offset instead of 6 with a 4 byte offset.
+  Everything after it then shifted, and a hook placed on such a prologue built
+  its trampoline out of garbage. Delphi emits exactly this in
+  System.Set8087CW, so it hits any tool that instruments the RTL.
+}
 procedure Decode_NA_OfstV(PInst: PInstruction);
+var
+  OfsSize: Byte;
 begin
   SetOpCode(PInst);
-  Decode_Imm(PInst, PInst.LID.vOpSize);
+  if PInst^.Archi = CPUX64 then
+  begin
+    if PInst^.Prefixes and Prf_AddrSize <> 0 then
+      OfsSize := ops32bits
+    else
+      OfsSize := ops64bits;
+  end
+  else
+  begin
+    if PInst^.Prefixes and Prf_AddrSize <> 0 then
+      OfsSize := ops16bits
+    else
+      OfsSize := ops32bits;
+  end;
+  Decode_Imm(PInst, OfsSize);
   PInst.Disp.Value := PInst.Imm.Value;
   PInst.Disp.Size := PInst.Imm.Size;
   PInst.Disp.Flags := dfUsed or dfOffset;

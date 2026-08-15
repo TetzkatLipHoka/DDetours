@@ -279,6 +279,8 @@ const
   SErrorUnsupportedMultiNop = 'Multi Bytes Nop Instructions not supported by your CPU.';
   SErrorRipDisp = 'Failed to correcr RIP Displacement.';
   SErrorBigTrampoSize = 'Exceed maximum TrampoSize.';
+  SErrorBranchIntoPatch = 'Function branches back into the first %d bytes ' +
+    '(loop target at offset %d) - an inline patch there cannot be relocated.';
   SErrorMaxHook = 'Exceed maximum allowed of hooks.';
   SErrorInvalidTargetProc = 'Invalid TargetProc Pointer.';
   SErrorInvalidInterceptProc = 'Invalid InterceptProc Pointer.';
@@ -745,6 +747,165 @@ begin
       MEM_64 := MEM_TOP_DOWN;
 {$ENDIF CPUX64}
     Result := InternalFuncs.VirtualAlloc(nil, MemSize, MEM_RESERVE or MEM_COMMIT or MEM_64, flProtect);
+  end;
+end;
+
+procedure FillNop(var P; Size: Integer; MultipleNop: Boolean); forward;
+
+{
+  Trampoline memory pool.
+
+  Until now every hooked function got its own VirtualAlloc. The block is one
+  page, but VirtualAlloc hands out addresses on the 64 KB allocation
+  granularity - so each hook consumed a whole granule and left roughly 60 KB of
+  free but unusable address space behind it.
+
+  Measured on a 32-bit target: total free memory stayed at ~1.4 GB throughout,
+  while the largest CONTIGUOUS free block collapsed from 820 MB unhooked to
+  506 MB at 5000 hooks, 63 MB at 20000 and 27 MB at 27000 - with the number of
+  free holes tracking the hook count almost exactly (one hole per hook). Past
+  that point Direct2D can no longer obtain a surface and growing streams fail,
+  so the process dies of symptoms that look nothing like hooking. On x64 the
+  same waste happens, it just takes far longer to hurt.
+
+  Blocks now come out of pools exactly one allocation granule in size, so a
+  fully used pool leaves no gap at all and the committed amount is unchanged.
+  Free slots are chained through their own first pointer; a pool that runs
+  empty is released.
+
+  On x64 a trampoline wants to stay within rel32 reach of its target (else the
+  patch grows from 5-6 to 14 bytes), so pools are matched against the requested
+  address and a new pool is placed next to it.
+}
+type
+  PTrampoPool = ^TTrampoPool;
+
+  TTrampoPool = record
+    Next: PTrampoPool;
+    Base: PByte;
+    Size: NativeUInt;
+    FreeSlot: PByte;          { head of the free chain, linked in-place }
+    Used: Integer;
+  end;
+
+var
+  TrampoPools: PTrampoPool = nil;
+
+function PoolInReach(Pool: PTrampoPool; const Addr: Pointer): Boolean;
+{$IFDEF CPUX64}
+var
+  Lo, Hi: Int64;
+{$ENDIF CPUX64}
+begin
+{$IFDEF CPUX64}
+  if not Assigned(Addr) then
+    Exit(True);
+  Lo := Int64(NativeInt(Pool^.Base)) - Int64(NativeInt(Addr));
+  Hi := Lo + Int64(Pool^.Size);
+  { comfortably inside rel32, no need to squeeze the last megabyte }
+  Result := (Lo > -$70000000) and (Hi < $70000000);
+{$ELSE !CPUX64}
+  Result := True;
+{$ENDIF CPUX64}
+end;
+
+function NewTrampoPool(const Addr: Pointer): PTrampoPool;
+var
+  Sz: NativeUInt;
+  P, Slot: PByte;
+  i, n: Integer;
+begin
+  Result := nil;
+  Sz := SysInfo.dwAllocationGranularity;
+  if Sz < SizeOfAlloc then
+    Sz := SizeOfAlloc;
+  P := TryAllocMemAt(Addr, Sz, PAGE_EXECUTE_READWRITE);
+  if not Assigned(P) then
+    Exit;
+
+  Result := AllocMem(SizeOf(TTrampoPool));
+  Result^.Base := P;
+  Result^.Size := Sz;
+  Result^.Used := 0;
+  Result^.FreeSlot := nil;
+  n := Sz div SizeOfAlloc;
+  { backwards, so the chain hands out ascending addresses }
+  for i := n - 1 downto 0 do
+  begin
+    Slot := P + NativeUInt(i) * SizeOfAlloc;
+    PPointer(Slot)^ := Result^.FreeSlot;
+    Result^.FreeSlot := Slot;
+  end;
+  Result^.Next := TrampoPools;
+  TrampoPools := Result;
+end;
+
+function AllocTrampoBlock(const Addr: Pointer): PByte;
+var
+  Pool: PTrampoPool;
+begin
+  Result := nil;
+  EnterLook(FLock);
+  try
+    Pool := TrampoPools;
+    while Assigned(Pool) do
+    begin
+      if Assigned(Pool^.FreeSlot) and PoolInReach(Pool, Addr) then
+        Break;
+      Pool := Pool^.Next;
+    end;
+    if not Assigned(Pool) then
+      Pool := NewTrampoPool(Addr);
+    if not Assigned(Pool) then
+      Exit;
+
+    Result := Pool^.FreeSlot;
+    Pool^.FreeSlot := PPointer(Result)^;
+    Inc(Pool^.Used);
+    FillNop(Result^, SizeOfAlloc, False);
+  finally
+    LeaveLook(FLock);
+  end;
+end;
+
+function FreeTrampoBlock(P: PByte): Boolean;
+var
+  Pool, Prev: PTrampoPool;
+begin
+  Result := False;
+  if not Assigned(P) then
+    Exit(True);
+  EnterLook(FLock);
+  try
+    Prev := nil;
+    Pool := TrampoPools;
+    while Assigned(Pool) do
+    begin
+      if (NativeUInt(P) >= NativeUInt(Pool^.Base)) and
+         (NativeUInt(P) < NativeUInt(Pool^.Base) + Pool^.Size) then
+        Break;
+      Prev := Pool;
+      Pool := Pool^.Next;
+    end;
+    if not Assigned(Pool) then
+      Exit;                              { not ours - leave it alone }
+
+    PPointer(P)^ := Pool^.FreeSlot;
+    Pool^.FreeSlot := P;
+    Dec(Pool^.Used);
+    Result := True;
+
+    if Pool^.Used <= 0 then
+    begin
+      if Assigned(Prev) then
+        Prev^.Next := Pool^.Next
+      else
+        TrampoPools := Pool^.Next;
+      InternalFuncs.VirtualFree(Pool^.Base, 0, MEM_RELEASE);
+      FreeMem(Pool);
+    end;
+  finally
+    LeaveLook(FLock);
   end;
 end;
 
@@ -1966,11 +2127,24 @@ begin
   Inst.Archi := CPUX;
   Inst.VirtualAddr := nil;
   {
-    While the opcode is jmp and the jmp destination
+    While the opcode is a RELATIVE jmp and the jmp destination
     address is known get the next jmp .
+
+    Relative only, on purpose. A relative JMP is a link-time stub: part of the
+    same module, fixed target, and following it is what the caller means.
+
+    An INDIRECT jmp is a different animal - JMP [slot] is an import thunk, and
+    its "target" is whatever the data slot holds at this very moment. Following
+    it would take the hook out of the caller's module and plant it on the
+    imported routine itself, process wide: hooking a Delphi unit's
+    System.GetCurrentThreadId thunk would end up patching kernel32, hitting
+    every caller in the process including the loader and the hook machinery.
+    The slot can also be rebound later (delay load), so the address is not even
+    stable. Hook the thunk that was asked for and leave the slot alone.
   }
   fDecodeInst(@Inst);
-  if (Inst.OpType = otJMP) and (Assigned(Inst.Branch.Target)) then
+  if (Inst.OpType = otJMP) and Assigned(Inst.Branch.Target) and
+     (Inst.Branch.Falgs and bfRel <> 0) then
     Result := GetRoot(Inst.Branch.Target);
 end;
 
@@ -2028,6 +2202,68 @@ begin
   Result^.ExMem := nil;
 end;
 
+{
+  Does the function branch back into the bytes we are about to overwrite ?
+
+  Stealing the first Sb bytes only works if nothing ever jumps *into* that
+  range. A tight loop whose target sits a few bytes past the entry breaks that
+  assumption: the first iteration runs our JMP, the second one jumps straight
+  into the middle of it and executes the displacement as code. Delphi emits
+  this shape readily, e.g. Vcl.Imaging.pngimage.TPngImage.InitializeGamma:
+
+      xor  edx, edx              ; +0
+      mov  ecx, edx              ; +2   <- loop target
+      mov  [eax+edx+146h], cl
+      mov  [eax+edx+30h], cl
+      inc  edx
+      cmp  edx, 100h
+      jne  -22                   ; back to +2
+      ret
+
+  With a 5 byte patch at +0 the target +2 lands inside it and the process dies
+  on the second iteration, far away from the hook and impossible to attribute.
+  Relocation cannot repair this - the only correct answer is to refuse.
+
+  Best effort scan: walk instructions until the first RET (functions with a
+  branch into their own prologue always close it well before that) or until a
+  decode failure. Only relative branches count; an absolute or indirect one
+  cannot be resolved statically and is left alone.
+}
+function BranchIntoPatchArea(P: PByte; PatchSize: Byte): Integer;
+const
+  kMaxScan = 1024;
+var
+  Inst: TInstruction;
+  Scanned, Sz: Integer;
+  Target: PByte;
+begin
+  Result := -1;
+  FillChar(Inst, SizeOf(TInstruction), #00);
+  Inst.Archi := CPUX;
+  Inst.NextInst := P;
+  Inst.VirtualAddr := nil;
+  Scanned := 0;
+  while Scanned < kMaxScan do
+  begin
+    Inst.Addr := Inst.NextInst;
+    Sz := fDecodeInst(@Inst);
+    if Sz <= 0 then
+      Break;
+    Inc(Scanned, Sz);
+
+    if (Inst.Branch.Falgs and bfUsed <> 0) and (Inst.Branch.Falgs and bfRel <> 0) then
+    begin
+      Target := Inst.Branch.Target;
+      { Target = P is harmless: that is the hook entry itself. }
+      if (Target > P) and (Target < P + PatchSize) then
+        Exit(Integer(NativeInt(Target) - NativeInt(P)));
+    end;
+
+    if Inst.OpType = otRET then
+      Break;
+  end;
+end;
+
 procedure InsertDescriptor(PAt: PByte; PDscr: PDescriptor);
 const
   { JMP from Target to Code Entry }
@@ -2052,6 +2288,7 @@ var
   Sb: Byte;
   OrgAccess: DWORD;
   Tsz: Integer;
+  BrOfs: Integer;
   PExMem: PByte;
   LPExMem: PByte;
 begin
@@ -2061,7 +2298,7 @@ begin
   fJmpType := GetJmpType(P, @PDscr^.CodeEntry, @PDscr^.DscrAddr);
 {$IFDEF CPUX64}
   Tmp := nil;
-  PExMem := TryAllocMemAt(P, SizeOfAlloc, PAGE_EXECUTE_READWRITE);
+  PExMem := AllocTrampoBlock(P);          { pooled, see TTrampoPool }
   LPExMem := PExMem;
   sJmpType := JT_NONE;
   JmpKind := kJmpRipZCE;
@@ -2092,7 +2329,7 @@ begin
     JmpKind := kJmpCE;
   end;
 {$ELSE !CPUX64}
-  PExMem := TryAllocMemAt(nil, SizeOfAlloc, PAGE_EXECUTE_READWRITE);
+  PExMem := AllocTrampoBlock(nil);        { pooled, see TTrampoPool }
   JmpKind := kJmpCE;
   LPExMem := PExMem;
 {$ENDIF CPUX64}
@@ -2127,6 +2364,11 @@ begin
 
   if Sb > TrampoSize then
     raise InterceptException.Create(SErrorBigTrampoSize);
+
+  { Refuse before touching the target: see BranchIntoPatchArea. }
+  BrOfs := BranchIntoPatchArea(P, Sb);
+  if BrOfs >= 0 then
+    raise InterceptException.CreateFmt(SErrorBranchIntoPatch, [Sb, BrOfs]);
 
   { Trampoline momory }
   T := PExMem;
@@ -2337,7 +2579,8 @@ begin
 
     if Assigned(PDscr^.ExMem) then
     begin
-      vr := InternalFuncs.VirtualFree(PDscr^.ExMem, 0, MEM_RELEASE);
+      { back into the pool; the pool itself is released once it runs empty }
+      vr := FreeTrampoBlock(PDscr^.ExMem);
       if not vr then
         RaiseLastOSError;
     end;
@@ -3252,9 +3495,25 @@ initialization
   FLock := TCriticalSection.Create();
 {$ENDIF SUPPORTS_MONITOR}
 GetSystemInfo(SysInfo);
-SizeOfAlloc := SysInfo.dwPageSize;
+{
+  Slot size inside a trampoline pool.
+
+  This used to be a whole page, because every hook got its own VirtualAlloc and
+  a page is the smallest thing worth reserving. With pooling that reason is
+  gone: slots live inside one shared RWX block, so page boundaries no longer
+  matter and rounding each hook up to 4 KB is pure waste - roughly 20x, since
+  the actual need is TmpSize + TrampoSize + 64, about 190 bytes.
+
+  The reserve on top is deliberate. MapInsts can translate a rip-relative
+  instruction into the absolute form (push reg / mov reg, abs64 / op [reg] /
+  pop reg), which inflates it, so the relocated prologue can be several times
+  the size of the original. 512 covers the worst case with room to spare and
+  still fits 128 slots into a 64 KB granule instead of 16.
+}
+SizeOfAlloc := 512;
 if SizeOfAlloc < (TmpSize + TrampoSize + 64) then
   SizeOfAlloc := (TmpSize + TrampoSize + 64);
+SizeOfAlloc := (SizeOfAlloc + 15) and not 15;      { 16-byte aligned code }
 {$IFDEF FPC}
 OpenThread := nil;
 {$ELSE !FPC}

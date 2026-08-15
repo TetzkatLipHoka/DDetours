@@ -25,7 +25,7 @@ cd /d "%~dp0"
 
 set "LIB32=%DELPHIROOT%\lib\win32\release"
 set "LIB64=%DELPHIROOT%\lib\win64\release"
-set "SRC=%~dp0.."
+set "SRC=%~dp0..\Source"
 set "NS=System;System.Win;Winapi"
 
 :: -DCI keeps the DUnitX console runner from waiting for a key press.
@@ -33,18 +33,18 @@ set DEF=-DCI
 if /I "%~1"=="force" set DEF=-DCI -DDDETOURS_FORCE_ABSRIP
 
 echo === Test suite Win32 %DEF% ===
-dcc32 -B -Q %DEF% -U"%LIB32%;%SRC%" -NS"%NS%" -E"%~dp0." -TX.x86.exe Test.dpr
+dcc32 -B -Q %DEF% -U"%LIB32%;%SRC%" -NS"%NS%" -N"%~dp0." -E"%~dp0." -TX.x86.exe Test.dpr
 if errorlevel 1 goto :buildfailed
 echo === Test suite Win64 %DEF% ===
-dcc64 -B -Q %DEF% -U"%LIB64%;%SRC%" -NS"%NS%" -E"%~dp0." -TX.x64.exe Test.dpr
+dcc64 -B -Q %DEF% -U"%LIB64%;%SRC%" -NS"%NS%" -N"%~dp0." -E"%~dp0." -TX.x64.exe Test.dpr
 if errorlevel 1 goto :buildfailed
 
 :: DecodeProbe is a diagnostic tool, not part of the suite - built, not run.
 :: Run it by hand when a hook corrupts its target: it shows what the decoder
 :: makes of an instruction (a wrong length is the usual culprit).
 echo === DecodeProbe (diagnostic, not executed) ===
-dcc32 -B -Q -U"%LIB32%;%SRC%" -NS"%NS%" -TX.x86.exe DecodeProbe.dpr
-dcc64 -B -Q -U"%LIB64%;%SRC%" -NS"%NS%" -TX.x64.exe DecodeProbe.dpr
+dcc32 -B -Q -U"%LIB32%;%SRC%" -NS"%NS%" -N"%~dp0." -TX.x86.exe DecodeProbe.dpr
+dcc64 -B -Q -U"%LIB64%;%SRC%" -NS"%NS%" -N"%~dp0." -TX.x64.exe DecodeProbe.dpr
 
 del /q *.dcu 2>nul
 

@@ -832,7 +832,7 @@ begin
   { backwards, so the chain hands out ascending addresses }
   for i := n - 1 downto 0 do
   begin
-    Slot := P + NativeUInt(i) * SizeOfAlloc;
+    Slot := PByte(NativeUInt(P) + NativeUInt(i) * NativeUInt(SizeOfAlloc));
     PPointer(Slot)^ := Result^.FreeSlot;
     Result^.FreeSlot := Slot;
   end;
@@ -874,7 +874,10 @@ var
 begin
   Result := False;
   if not Assigned(P) then
-    Exit(True);
+  begin
+    Result := True;
+    Exit;
+  end;
   EnterLook(FLock);
   try
     Prev := nil;
@@ -2255,8 +2258,12 @@ begin
     begin
       Target := Inst.Branch.Target;
       { Target = P is harmless: that is the hook entry itself. }
-      if (Target > P) and (Target < P + PatchSize) then
-        Exit(Integer(NativeInt(Target) - NativeInt(P)));
+      if (NativeUInt(Target) > NativeUInt(P)) and
+         (NativeUInt(Target) < NativeUInt(P) + NativeUInt(PatchSize)) then
+      begin
+        Result := Integer(NativeInt(Target) - NativeInt(P));
+        Exit;
+      end;
     end;
 
     if Inst.OpType = otRET then

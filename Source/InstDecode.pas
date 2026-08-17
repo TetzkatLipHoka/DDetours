@@ -964,7 +964,14 @@ begin
       PInst^.Branch.Falgs := PInst^.Branch.Falgs or bfRip;
       P := PByte(NativeInt(VA) + NativeInt(PInst^.Disp.Value));
       { Memory 64-bits }
-      PInst^.Branch.Target := PByte(PUInt64(P)^);
+      { Guard like the x86 branch below: when decoding from unmapped memory
+        (static analysis out of a file buffer) P points nowhere and the raw
+        deref would kill the process. At run time the slot is mapped, so Target
+        resolves exactly as before - no behavioural change, length unaffected. }
+      if IsBadReadPtrEx( P, 8 ) then
+        PInst^.Branch.Target := nil
+      else
+        PInst^.Branch.Target := PByte(PUInt64(P)^);
     end
     else
     begin

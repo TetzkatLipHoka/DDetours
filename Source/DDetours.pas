@@ -122,6 +122,20 @@ function ExitRecursiveSection(var TrampoLine): Boolean;
 function GetCreatorThreadIdFromTrampoline(var TrampoLine): TThreadId;
 function GetTrampolineParam(var TrampoLine): Pointer;
 
+{
+  For a hook created via InterceptCreate, report the original target address,
+  the trampoline code that runs the relocated (stolen) prologue, and the number
+  of stolen prologue bytes. Lets a caller redirect a thread whose IP is inside
+  the overwritten prologue of a still-running target (attach-time hooking) to
+  the equivalent point in the trampoline: newIP := ATrampoCode + (IP - AOrgAddr)
+  for AOrgAddr <= IP < AOrgAddr + AStolenSize. Returns False if TrampoLine is
+  not a valid DDetours trampoline. AOrgAddr/ATrampoCode are only meaningful for
+  hooks whose stolen bytes contain no relative branch (guaranteed here by the
+  BranchIntoPatchArea refusal), so the relocation is length-preserving.
+}
+function GetTrampolineInfo(TrampoLine: Pointer; out AOrgAddr, ATrampoCode: Pointer;
+  out AStolenSize: Integer): Boolean;
+
 {$IFDEF SUPPORTS_GENERICS}
 type
   IIntercept<T, U> = interface(IInterface)
@@ -2509,6 +2523,28 @@ begin
       Exit;
   end;
   raise DetourException.Create(SErrorInvalidTrampoline);
+end;
+
+function GetTrampolineInfo(TrampoLine: Pointer; out AOrgAddr, ATrampoCode: Pointer;
+  out AStolenSize: Integer): Boolean;
+var
+  NH: PNextHook;
+begin
+  Result := False;
+  AOrgAddr := nil;
+  ATrampoCode := nil;
+  AStolenSize := 0;
+  if not Assigned(TrampoLine) then
+    Exit;
+  NH := PNextHook(NativeInt(TrampoLine) - SizeOf(TNextHook));
+  if NH^.Signature <> TrampolineSignature then
+    Exit;
+  if (NH^.PDscr = nil) or (NH^.PDscr^.Trampo = nil) then
+    Exit;
+  AOrgAddr := NH^.PDscr^.OrgPtr;
+  ATrampoCode := NH^.PDscr^.Trampo^.Addr;
+  AStolenSize := NH^.PDscr^.Trampo^.Size;
+  Result := True;
 end;
 
 function AddHook(PDscr: PDescriptor; InterceptProc: PByte; Param: Pointer; Options: TInterceptOptions): PByte;

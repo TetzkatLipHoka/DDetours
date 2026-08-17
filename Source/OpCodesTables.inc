@@ -204,7 +204,7 @@ const OneByteTable : array[Byte] of Byte =(//
 {0x5F} 11, {POP}
 {0x60} 04, {PUSHAD/PUSHA}
 {0x61} 04, {POPAD/POPA}
-{0x62} 12, {BOUND}
+{0x62} 84, {EVEX prefix; in 32-bit mode this is BOUND unless the next byte's top bits = 11}
 {0x63} 01, {ARPL/MOVSXD}
 {0x64} 13, {FS_Prefix}
 {0x65} 14, {GS_Prefix}
@@ -380,9 +380,9 @@ const TwoByteTable : array[Byte] of Byte =(//
 {0x0A} 21, {CL1INVMB}
 {0x0B} 21, {UD1}
 {0x0C} 00, {InvalidOpCode}
-{0x0D} 21, {3DNow}
-{0x0E} 21, {3DNow}
-{0x0F} 21, {3DNow}
+{0x0D} 01, {PREFETCH (AMD): has a full ModRm}
+{0x0E} 21, {FEMMS: no ModRm}
+{0x0F} 20, {3DNow: ModRm + 1 suffix byte (same length as ModRm+Ib)}
 {0x10} 59, {VMOVUPD/VMOVSD/VMOVSS/VMOVUPS}
 {0x11} 59, {VMOVUPD/VMOVSD/VMOVSS/VMOVUPS}
 {0x12} 59, {VMOVLPD/VMOVDDUP/VMOVSLDUP/VMOVLPS/VMOVHLPS}

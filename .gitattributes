@@ -1,0 +1,26 @@
+# Line-ending policy.
+#
+# The repository stores text as LF. Delphi/Lazarus sources are checked out with
+# CRLF, because the Delphi IDE (and DDevExtensions) rely on CRLF terminators -
+# some IDE operations use hardcoded CRLF offsets and misbehave on LF-only files.
+# On commit Git normalises CRLF -> LF, so the repo stays clean no matter which
+# editor touched a file. This is enforced here so it does not depend on each
+# clone's core.autocrlf setting.
+
+* text=auto
+
+*.pas   text eol=crlf
+*.inc   text eol=crlf
+*.dpr   text eol=crlf
+*.dpk   text eol=crlf
+*.dfm   text eol=crlf
+*.dproj text eol=crlf
+*.lpr   text eol=crlf
+*.lpi   text eol=crlf
+*.lps   text eol=crlf
+*.lfm   text eol=crlf
+
+# Binary assets: never touch.
+*.ico   binary
+*.res   binary
+*.dcu   binary

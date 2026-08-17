@@ -2144,10 +2144,31 @@ begin
     every caller in the process including the loader and the hook machinery.
     The slot can also be rebound later (delay load), so the address is not even
     stable. Hook the thunk that was asked for and leave the slot alone.
+
+    REL32 only, and that is not cosmetic. A link-time stub is always E9 rel32.
+    A short EB rel8 reaches +-127 bytes, which in practice means it stays
+    inside the very function we were asked to hook - it is ordinary control
+    flow, not a stub. Following it plants the hook in the middle of the
+    function body, and if that body is a loop the hook is entered once per
+    iteration while the function returns exactly once. The return address swap
+    cannot survive that and the process dies with an access violation nowhere
+    near the hook.
+
+    Measured 2026-08-16 on Converter.exe (x64):
+      SynEdit.TDictionary<THookedCommandEvent,Pointer>.TPairEnumerator.MoveNext
+      EB 1F           jmp +21h        <- GetRoot followed this
+      +02             loop head
+      ...
+      7C C6           jl  -3Ah        -> back to +02
+    The hook ended up at +21h, inside the loop. Clicking into a SynEdit killed
+    the process instantly. With rel8 excluded the hook goes to +00 again, where
+    BranchIntoPatchArea correctly refuses it: the loop target at +02 sits inside
+    the patch. Refusing is the right answer - that function is not patchable.
   }
   fDecodeInst(@Inst);
   if (Inst.OpType = otJMP) and Assigned(Inst.Branch.Target) and
-     (Inst.Branch.Falgs and bfRel <> 0) then
+     (Inst.Branch.Falgs and bfRel <> 0) and
+     (Inst.Branch.Size = ops32bits) then
     Result := GetRoot(Inst.Branch.Target);
 end;
 

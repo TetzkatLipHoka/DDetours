@@ -88,6 +88,9 @@ type
     [Test] procedure LoopIntoPatchArea_IsRefused;
     // same shape but the loop starts past the patch -> must still hook
     [Test] procedure LoopBeyondPatchArea_IsHooked;
+    // entry is a short JMP into the own body: GetRoot must NOT follow it,
+    // otherwise the hook lands inside the loop and the refusal never happens
+    [Test] procedure ShortJmpIntoOwnBody_IsRefused;
   end;
 
   {
@@ -122,6 +125,19 @@ type
   TDecoderSizeTests = class(TObject)
   public
     [Test] procedure Moffs_OperandSizePrefix_DoesNotShrinkOffset;
+    { Die folgenden Faelle stammen aus dem Iced-Abgleich (DecodeCmp,
+      2026-08-16): 1444 Abweichungen in einer Delphi-x64-Exe, 349 in der
+      x86-Variante, auf 0 gebracht. Jeder Test deckt eine Fehlerfamilie ab
+      und ist mit expliziter Architektur formuliert - der Decoder schaltet
+      zur Laufzeit, also prueft jeder Build beide Modi. }
+    [Test] procedure LegacyPrefix_DoesNotTruncateInstruction;
+    [Test] procedure MovCrDr_IgnoresModField;
+    [Test] procedure GroupOpcodes_CarryModRm;
+    [Test] procedure Vex2_VersusLds_OnX86;
+    [Test] procedure Rex_LastRexWins_And_LegacyPrefixKillsRex;
+    [Test] procedure FarPointer_HonoursOperandSize;
+    [Test] procedure Evex_LengthIsDecoded;
+    [Test] procedure Branch66_OnX64_KeepsRel32;
   end;
 
 implementation
@@ -290,6 +306,62 @@ asm
         jne     @@loop
         mov     eax, edx
         db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
+end;
+
+{
+  A function whose FIRST instruction is a short JMP into its own body.
+
+  This is the shape that killed Converter.exe (x64): Delphi compiles
+    while <cond> do begin ... end
+  as "jmp to the condition at the end, loop head right after". The entry is
+  therefore EB rel8, and the loop head sits at +2 - inside any inline patch.
+
+  GetRoot follows relative jumps to get past link-time stubs. A short rel8 jump
+  is NOT a stub, it cannot even leave the function (+-127 bytes). Following it
+  puts the hook in the middle of the loop body, where it is entered once per
+  iteration while the function returns exactly once - the return address swap
+  of a profiler cannot survive that, and the process dies far from the hook.
+
+  With rel8 excluded, GetRoot stays at +0 and BranchIntoPatchArea sees the loop
+  target at +2 inside the patch: refused, which is the correct answer.
+
+  Written as raw bytes, because Delphi's assembler picks the near form for a
+  forward jump and would destroy the very shape under test. Never called.
+}
+function ShortJmpIntoOwnBody: Integer;
+asm
+{$IFDEF CPUX64}
+  // taken verbatim from Converter.exe, RVA $655E60:
+  // SynEdit.TDictionary<THookedCommandEvent,Pointer>.TPairEnumerator.MoveNext
+  db $EB,$1F                                   // +00 jmp +21h
+  db $48,$83,$41,$10,$01                       // +02 loop head <- inside patch
+  db $48,$8B,$41,$08
+  db $48,$8B,$40,$08
+  db $48,$8B,$51,$10
+  db $48,$C1,$E2,$02
+  db $83,$3C,$D0,$FF
+  db $74,$04
+  db $B0,$01
+  db $EB,$1D
+  db $48,$8B,$41,$08                           // +21 GetRoot landed HERE
+  db $48,$8B,$40,$08
+  db $48,$85,$C0
+  db $74,$04
+  db $48,$8B,$40,$F8
+  db $48,$8D,$40,$FF
+  db $48,$39,$41,$10
+  db $7C,$C6                                   // +3A jl -> back to +02
+  db $33,$C0
+  db $C3
+{$ELSE !CPUX64}
+  db $EB,$05                                   // +00 jmp +07
+  db $42                                       // +02 inc edx  <- inside patch
+  db $83,$FA,$10                               // +03 cmp edx,16
+  db $90                                       // +06
+  db $7C,$F9                                   // +07 jl -> back to +02
+  db $C3                                       // +09
+{$ENDIF CPUX64}
+  db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
 end;
 
 // The imported routine an import thunk would forward to.
@@ -471,6 +543,18 @@ begin
   end;
 end;
 
+procedure TPatchAreaTests.ShortJmpIntoOwnBody_IsRefused;
+begin
+  Assert.WillRaise(
+    procedure
+    begin
+      InterceptCreate(@ShortJmpIntoOwnBody, @DummyInt);
+    end,
+    Exception,
+    'GetRoot followed the entry JMP into the function body - the hook then ' +
+    'sits inside the loop and is entered once per iteration for a single return');
+end;
+
 { TImportThunkTests }
 
 procedure TImportThunkTests.ImportThunk_IsRelocated;
@@ -500,7 +584,7 @@ end;
 
 { TDecoderSizeTests }
 
-function DecodedSize(const ABytes: array of Byte): Integer;
+function DecodedSizeA(AArchi: Byte; const ABytes: array of Byte): Integer;
 var
   Inst: TInstruction;
   Buf: array [0 .. 31] of Byte;
@@ -510,11 +594,16 @@ begin
   for i := 0 to High(ABytes) do
     Buf[i] := ABytes[i];
   FillChar(Inst, SizeOf(TInstruction), #00);
-  Inst.Archi := {$IFDEF CPUX64}CPUX64{$ELSE}CPUX32{$ENDIF};
+  Inst.Archi := AArchi;
   Inst.Options := DecodeVex;
   Inst.Addr := @Buf[0];
   Inst.VirtualAddr := nil;
   Result := DecodeInst(@Inst);
+end;
+
+function DecodedSize(const ABytes: array of Byte): Integer;
+begin
+  Result := DecodedSizeA({$IFDEF CPUX64}CPUX64{$ELSE}CPUX32{$ENDIF}, ABytes);
 end;
 
 procedure TDecoderSizeTests.Moffs_OperandSizePrefix_DoesNotShrinkOffset;
@@ -540,6 +629,108 @@ begin
   Assert.AreEqual(6, DecodedSize([$66, $A3, $30, $90, $BF, $00]),
     'operand-size prefix shrank the moffs offset');
 {$ENDIF}
+end;
+
+procedure TDecoderSizeTests.LegacyPrefix_DoesNotTruncateInstruction;
+begin
+  // 66/F2/F3 vor einem 2-Byte- oder FPU-Opcode ohne Praefix-Variante ist ein
+  // gewoehnliches Legacy-Praefix - die Instruktion bleibt gueltig und traegt
+  // ihr ModRm. Frueher brach der MndPrf-Guard nach dem Opcode ab.
+  // 66 0F B6 C8         movzx cx, al                     4 Byte
+  Assert.AreEqual(4, DecodedSizeA(CPUX64, [$66, $0F, $B6, $C8]), '66 0F B6 x64');
+  Assert.AreEqual(4, DecodedSizeA(CPUX32, [$66, $0F, $B6, $C8]), '66 0F B6 x86');
+  // 66 0F 1F 44 00 00   NOP word ptr [rax+rax]           6 Byte (Ausrichtung)
+  Assert.AreEqual(6, DecodedSizeA(CPUX64, [$66, $0F, $1F, $44, $00, $00]),
+    '66 0F 1F NOP x64');
+  Assert.AreEqual(6, DecodedSizeA(CPUX32, [$66, $0F, $1F, $44, $00, $00]),
+    '66 0F 1F NOP x86');
+  // 0F AE 15 <disp32>   ldmxcsr [rip+d] / stmxcsr        7 Byte (Group 15 mem)
+  Assert.AreEqual(7, DecodedSizeA(CPUX64, [$0F, $AE, $15, 1, 2, 3, 4]),
+    '0F AE mem x64');
+  // 0F AE E8            lfence                            3 Byte (Group 15 reg)
+  Assert.AreEqual(3, DecodedSizeA(CPUX64, [$0F, $AE, $E8]), '0F AE lfence x64');
+  // F3 D8 C1            fcomp (F3 als Legacy vor FPU)     3 Byte
+  Assert.AreEqual(3, DecodedSizeA(CPUX32, [$F3, $D8, $C1]), 'F3 D8 fpu x86');
+end;
+
+procedure TDecoderSizeTests.MovCrDr_IgnoresModField;
+begin
+  // 0F 20 /r: MOV r32, CRn. Die Hardware ignoriert ModRm.Mod, die Form ist
+  // immer 3 Byte - kein SIB, kein Disp. 0F 20 54 haette sonst SIB+disp8
+  // mitgelesen (Iced=3, alt DDetours=5).
+  Assert.AreEqual(3, DecodedSizeA(CPUX64, [$0F, $20, $54]), '0F 20 CR x64');
+  Assert.AreEqual(3, DecodedSizeA(CPUX32, [$0F, $23, $C1]), '0F 23 DR x86');
+end;
+
+procedure TDecoderSizeTests.GroupOpcodes_CarryModRm;
+begin
+  // 0F B9 (UD1) traegt ein ModRm samt Operanden - Compiler nutzen es als
+  // absichtliche Falle. 0F B9 68 40 -> 4 Byte (alt 2).
+  Assert.AreEqual(4, DecodedSizeA(CPUX64, [$0F, $B9, $68, $40]), 'UD1 x64');
+  // 0F 0D (PREFETCH, AMD) hat ein ModRm. 0F 0D 49 48 -> 4 Byte (alt 2).
+  Assert.AreEqual(4, DecodedSizeA(CPUX64, [$0F, $0D, $49, $48]), '0F 0D x64');
+  // 3DNow: 0F 0F <modrm...> <suffix>. 0F 0F C1 0C (PI2FW) -> 4 Byte (alt 2).
+  Assert.AreEqual(4, DecodedSizeA(CPUX32, [$0F, $0F, $C1, $0C]), '3DNow x86');
+  // C6 F8 12  XABORT imm8 - das F8 ist das ModRm. 3 Byte (alt 2).
+  Assert.AreEqual(3, DecodedSizeA(CPUX64, [$C6, $F8, $12]), 'XABORT x64');
+end;
+
+procedure TDecoderSizeTests.Vex2_VersusLds_OnX86;
+begin
+  // C5 ist im 32-bit-Modus nur VEX2, wenn ModRm.Mod=11 (beide Topbits gesetzt).
+  // C5 99 4A ..: Folgebyte $4A hat mod=01 -> LDS mit Speicheroperand, NICHT VEX.
+  // Iced=6 (LDS mit disp), alt DDetours=4 (als VEX fehlgelesen).
+  Assert.AreEqual(6, DecodedSizeA(CPUX32, [$C5, $99, $4A, $00, $44, $00]),
+    'C5 mod<>11 is LDS on x86');
+  // Dasselbe C5 auf x64 ist immer VEX2 (kein LDS). C5 F8 77 vzeroupper -> 3 Byte.
+  Assert.AreEqual(3, DecodedSizeA(CPUX64, [$C5, $F8, $77]), 'vzeroupper x64');
+end;
+
+procedure TDecoderSizeTests.Rex_LastRexWins_And_LegacyPrefixKillsRex;
+begin
+  // 66 48 69 /r id: REX.W schlaegt 66 -> imm32, nicht imm16. ModRm C0 = reg.
+  // 66 48 69 C0 <imm32> -> 3 + 1 + 4 = 8 Byte.
+  Assert.AreEqual(8, DecodedSizeA(CPUX64, [$66, $48, $69, $C0, 1, 2, 3, 4]),
+    'REX.W beats 66 (imm32)');
+  // 4E 44 B8 <imm32>: zwei REX hintereinander, nur das LETZTE (44, W=0) zaehlt
+  // -> mov eax,imm32 = 3 + 4 = 7 Byte (nicht imm64).
+  Assert.AreEqual(7, DecodedSizeA(CPUX64, [$4E, $44, $B8, 1, 2, 3, 4]),
+    'last REX wins');
+  // 66 48 65 69 C0 <imm16>: GS-Praefix NACH dem REX annulliert es; danach
+  // wirkt nur noch das 66 -> imm16. 66(1) 48(1) 65(1) 69(1) C0(1) imm16(2) = 7.
+  // Ohne KillRex haette das tote REX.W imm32 erzwungen -> 9 Byte.
+  Assert.AreEqual(7, DecodedSizeA(CPUX64, [$66, $48, $65, $69, $C0, 1, 2]),
+    'legacy prefix after REX kills it');
+end;
+
+procedure TDecoderSizeTests.FarPointer_HonoursOperandSize;
+begin
+  // 9A cp: CALL far ptr16:32 -> 1 + 4 + 2 = 7 Byte (Standard-Operandengroesse).
+  Assert.AreEqual(7, DecodedSizeA(CPUX32, [$9A, 1, 2, 3, 4, 5, 6]), '9A ptr16:32');
+  // 66 9A cp: 66 macht daraus ptr16:16 -> Praefix + 2 + 2 = 6 Byte.
+  Assert.AreEqual(6, DecodedSizeA(CPUX32, [$66, $9A, 1, 2, 3, 4]), '66 9A ptr16:16');
+end;
+
+procedure TDecoderSizeTests.Evex_LengthIsDecoded;
+begin
+  // 62 F1 7E 48 6F 09  vmovdqu32 zmm1, [rcx] -> 6 Byte. Ohne EVEX-Handler war
+  // jede AVX-512-Instruktion 1 Byte lang (ntdll-memcpy voll davon).
+  Assert.AreEqual(6, DecodedSizeA(CPUX64, [$62, $F1, $7E, $48, $6F, $09]),
+    'EVEX vmovdqu32 x64');
+  // Im 32-bit-Modus ist 62 mit Folgebyte-mod<>11 BOUND. 62 44 24 08 (mod=01):
+  // BOUND r32, m -> 62 + modrm + sib + disp8 = 4 Byte.
+  Assert.AreEqual(4, DecodedSizeA(CPUX32, [$62, $44, $24, $08]), 'BOUND x86');
+end;
+
+procedure TDecoderSizeTests.Branch66_OnX64_KeepsRel32;
+begin
+  // 66 E9 <rel>: im 64-bit-Modus ignoriert 66 den near-Branch-Offset, der
+  // bleibt rel32. 66 E9 <rel32> -> 1 + 1 + 4 = 6 Byte (alt 4, mit rel16).
+  Assert.AreEqual(6, DecodedSizeA(CPUX64, [$66, $E9, 1, 2, 3, 4]),
+    '66 E9 keeps rel32 on x64');
+  // Auf x86 verkuerzt 66 den Offset wirklich auf rel16: 66 E9 <rel16> -> 4 Byte.
+  Assert.AreEqual(4, DecodedSizeA(CPUX32, [$66, $E9, 1, 2]),
+    '66 E9 is rel16 on x86');
 end;
 
 initialization

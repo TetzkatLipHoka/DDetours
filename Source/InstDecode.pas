@@ -95,6 +95,7 @@ const
   Prf_VEX = $1000;
   Prf_Vex2 = Prf_VEX or $2000;
   Prf_Vex3 = Prf_VEX or $4000;
+  Prf_Evex = Prf_VEX or $8000;
 
   { Segment Registers }
   Seg_CS = $01;
@@ -532,6 +533,8 @@ procedure Decode_SP_T38_F0_F7(PInst: PInstruction); forward;
 procedure Decode_66_ModRm_Ib(PInst: PInstruction); forward;
 { ================================== 83 ================================== }
 procedure Decode_F2_ModRm_Ib(PInst: PInstruction); forward;
+{ ================================== 84 ================================== }
+procedure Decode_EVEX_Prefix(PInst: PInstruction); forward;
 
 procedure JumpError(PInst: PInstruction); forward;
 procedure JumpToTableTwoByte(PInst: PInstruction); forward;
@@ -560,7 +563,7 @@ const
     JumpError { }
     );
 
-  DecoderProcTable: array [0 .. $54 - 1] of TDecoderProc = ( //
+  DecoderProcTable: array [0 .. $55 - 1] of TDecoderProc = ( //
     { 00 } Decode_InvalidOpCode,
     { 01 } Decode_NA_ModRm,
     { 02 } Decode_NA_Ib,
@@ -644,7 +647,8 @@ const
     { 80 } Decode_F2_ModRm,
     { 81 } Decode_SP_T38_F0_F7,
     { 82 } Decode_66_ModRm_Ib,
-    { 83 } Decode_F2_ModRm_Ib);
+    { 83 } Decode_F2_ModRm_Ib,
+    { 84 } Decode_EVEX_Prefix);
   { .$REGION 'COMMON' }
   { ========================== COMMON =============================== }
 
@@ -996,11 +1000,21 @@ procedure Decode_Ap(PInst: PInstruction);
 begin
   SetOpCode(PInst);
   PInst^.Branch.Falgs := bfUsed or bfFar;
-  { We must clear the upper word ! }
-  PInst^.Branch.Value := PUInt64(PInst^.NextInst)^ and $FFFFFFFFFFFF;
-  PInst^.Branch.Size := ops48bits;
+  if PInst^.LID.vOpSize = ops16bits then
+  begin
+    { 66 9A / 66 EA: ptr16:16 - 2 byte offset + 2 byte selector, not 4+2. }
+    PInst^.Branch.Value := PUInt32(PInst^.NextInst)^;
+    PInst^.Branch.Size := ops32bits;
+    Inc(PInst^.NextInst, ops32bits);
+  end
+  else
+  begin
+    { We must clear the upper word ! }
+    PInst^.Branch.Value := PUInt64(PInst^.NextInst)^ and $FFFFFFFFFFFF;
+    PInst^.Branch.Size := ops48bits;
+    Inc(PInst^.NextInst, ops48bits);
+  end;
   PInst^.Branch.Target := nil;
-  Inc(PInst^.NextInst, ops48bits);
 end;
 
 procedure Decode_Mp(PInst: PInstruction);
@@ -1037,9 +1051,36 @@ end;
 { .$REGION 'PREFIXES' }
 { ========================== PREFIXES =============================== }
 
+procedure KillRex(PInst: PInstruction); {$IFDEF MustInline}inline; {$ENDIF}
+begin
+  { A legacy prefix AFTER a REX cancels the REX (SDM 2.2.1: REX must sit
+    immediately before the opcode). 66 48 65 69 .. is therefore imul with
+    imm16, not imm32 - the W of the dead REX must no longer drive the
+    operand size. }
+  if PInst^.Prefixes and Prf_Rex = 0 then
+    Exit;
+  PInst^.Prefixes := PInst^.Prefixes and not Prf_Rex;
+  PInst^.Rex.Value := 0;
+  PInst^.Rex.B := False;
+  PInst^.Rex.X := False;
+  PInst^.Rex.R := False;
+  PInst^.Rex.W := False;
+  if PInst^.Prefixes and Prf_OpSize <> 0 then
+  begin
+    PInst^.LID.vOpSize := ops16bits;
+    PInst^.LID.zOpSize := ops16bits;
+  end
+  else
+  begin
+    PInst^.LID.vOpSize := ops32bits;
+    PInst^.LID.zOpSize := ops32bits;
+  end;
+end;
+
 procedure Decode_ES_Prefix(PInst: PInstruction);
 begin
   { ES Segment Override Prefix }
+  KillRex(PInst);
   Inc(PInst^.NextInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Seg_ES;
   PInst^.SegReg := Seg_ES;
@@ -1048,6 +1089,7 @@ end;
 
 procedure Decode_CS_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   { CS Segment Override Prefix }
   Inc(PInst^.NextInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Seg_CS;
@@ -1057,6 +1099,7 @@ end;
 
 procedure Decode_SS_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   { SS Segment Override Prefix }
   Inc(PInst^.NextInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Seg_SS;
@@ -1066,6 +1109,7 @@ end;
 
 procedure Decode_DS_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   { DS Segment Override Prefix }
   Inc(PInst^.NextInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Seg_DS;
@@ -1089,8 +1133,28 @@ begin
   PInst^.Rex.R := (PInst^.Rex.Value and 4 <> 0);
   PInst^.Rex.W := (PInst^.Rex.Value and 8 <> 0);
 
+  { Recompute both sizes on EVERY REX:
+    - REX.W overrides a preceding 66 (66 48 69 .. carries imm32, not
+      imm16), so reset zOpSize back to 32.
+    - Without W a SECOND REX restores the sizes - only the last REX before
+      the opcode counts (4E 44 B8 .. is mov eax,imm32, not imm64).
+    The reverse case - a legacy prefix AFTER the REX - is cancelled by
+    KillRex in the prefix handlers. }
   if PInst^.Rex.W then
+  begin
     PInst^.LID.vOpSize := ops64bits;
+    PInst^.LID.zOpSize := ops32bits;
+  end
+  else if PInst^.Prefixes and Prf_OpSize <> 0 then
+  begin
+    PInst^.LID.vOpSize := ops16bits;
+    PInst^.LID.zOpSize := ops16bits;
+  end
+  else
+  begin
+    PInst^.LID.vOpSize := ops32bits;
+    PInst^.LID.zOpSize := ops32bits;
+  end;
 
   Inc(PInst^.NextInst); // Skip Rex .
   DecoderProcTable[OneByteTable[PInst^.NextInst^]](PInst);
@@ -1098,6 +1162,7 @@ end;
 
 procedure Decode_FS_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   { FS Segment Override Prefix }
   Inc(PInst^.NextInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Seg_FS;
@@ -1107,6 +1172,7 @@ end;
 
 procedure Decode_GS_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   { GS Segment Override Prefix }
   Inc(PInst^.NextInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Seg_GS;
@@ -1116,6 +1182,7 @@ end;
 
 procedure Decode_OPSIZE_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_OpSize;
   PInst^.LID.vOpSize := ops16bits;
   PInst^.LID.zOpSize := ops16bits;
@@ -1126,6 +1193,7 @@ end;
 
 procedure Decode_ADSIZE_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_AddrSize;
   Inc(PInst^.NextInst);
   PInst^.AddrMode := AddressMode[PInst^.Archi];
@@ -1195,11 +1263,13 @@ begin
   begin
     Q := PInst^.NextInst;
     Inc(Q);
-    R := (Q^ and $80 <> 0);
     {
-      if R is set ==> Vex prefix is valid !
-      otherwise the instruction is LDS.
+      C5 is VEX2 in 32-bit mode only when ModRm.Mod = 11 - i.e. BOTH top
+      bits of the next byte are set (Intel SDM 2.3.5). Checking only bit 7
+      let e.g. C5 99 .. (mod = 10) pass as VEX; that is actually LDS with a
+      memory operand.
     }
+    R := (Q^ and $C0) = $C0;
     if not R then
     begin
       { LDS instruction }
@@ -1221,8 +1291,60 @@ begin
   DecoderProcTable[TwoByteTable[PInst^.NextInst^]](PInst);
 end;
 
+procedure Decode_EVEX_Prefix(PInst: PInstruction);
+var
+  P: Byte;
+  Q: PByte;
+begin
+  { $62: in 64-bit mode always EVEX (BOUND does not exist there). In
+    32-bit mode only when the two top bits of the next byte are 11 -
+    the same rule as for C4/C5 -, otherwise it is BOUND. }
+  if PInst^.Options and DecodeVex = 0 then
+  begin
+    Decode_NA_ModRm_I64(PInst);
+    Exit;
+  end;
+  if PInst^.Archi = CPUX32 then
+  begin
+    Q := PInst^.NextInst;
+    Inc(Q);
+    if (Q^ and $C0) <> $C0 then
+    begin
+      { BOUND }
+      Decode_NA_ModRm_I64(PInst);
+      Exit;
+    end;
+  end;
+
+  { For the LENGTH only this matters at EVEX: 4 prefix bytes, then the
+    normal table per mmm, pp as the mandatory prefix like with VEX.
+    Masking, broadcast and the disp8*N compression do not change the byte
+    count - a disp8 stays 1 byte, only its VALUE is scaled. Without this
+    handler every AVX-512 instruction (ntdll memcpy!) was 1 byte long. }
+  Inc(PInst^.NextInst); // Skip $62
+  PInst^.Prefixes := PInst^.Prefixes or Prf_Evex;
+  P := PInst^.NextInst^; // P0
+  PInst^.Rex.R := not(P and $80 <> 0);
+  PInst^.Rex.X := not(P and $40 <> 0);
+  PInst^.Rex.B := not(P and $20 <> 0);
+  PInst^.Vex.mmmmm := (P and $07);
+  Inc(PInst^.NextInst); // Skip P0
+  P := PInst^.NextInst^; // P1
+  Inc(PInst^.NextInst); // Skip P1
+  PInst^.Rex.W := (P and $80 <> 0);
+  PInst^.Vex.vvvv := $0F - ((P and $78) shr 3);
+  PInst^.Vex.PP := (P and 3);
+  PInst^.LID.MndPrf := PPToMndPrf[PInst^.Vex.PP];
+  Inc(PInst^.NextInst); // Skip P2 (mask/z/L'L/b/V' - length-neutral)
+  if PInst^.Vex.mmmmm in [1, 2, 3] then
+    mmmmmToEscProc[PInst^.Vex.mmmmm](PInst)
+  else
+    JumpError(PInst);
+end;
+
 procedure Decode_LOCK_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Lock;
   Inc(PInst^.NextInst);
   DecoderProcTable[OneByteTable[PInst^.NextInst^]](PInst);
@@ -1230,6 +1352,7 @@ end;
 
 procedure Decode_REPNE_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Repne;
   PInst^.LID.MndPrf := $F2;
   Inc(PInst^.NextInst);
@@ -1238,6 +1361,7 @@ end;
 
 procedure Decode_REPE_Prefix(PInst: PInstruction);
 begin
+  KillRex(PInst);
   PInst^.Prefixes := PInst^.Prefixes or Prf_Repe;
   PInst^.LID.MndPrf := $F3;
   Inc(PInst^.NextInst);
@@ -1692,7 +1816,10 @@ end;
 procedure Decode_Group_10_UD2(PInst: PInstruction);
 begin
   SetGroup(PInst);
-  Decode_InvalidOpCode(PInst);
+  { UD1 (0F B9 /r) has a ModRm with operands (Intel SDM) - the compiler
+    uses it as a deliberate trap, Iced decodes it fully. Previously decoding
+    bailed out after the opcode: 0F B9 68 40 became 2 instead of 4 bytes. }
+  Decode_NA_ModRm(PInst);
 end;
 
 procedure Decode_Group_11(PInst: PInstruction);
@@ -1716,7 +1843,9 @@ begin
     end
     else if (Reg = $07) then
     begin
-      Decode_NA_Ib(PInst);
+      { XABORT = C6 F8 ib: the F8 IS the ModRm byte and must be counted -
+        NA_Ib without ModRm made it 2 instead of 3 bytes. }
+      Decode_NA_ModRm_Ib(PInst);
       Exit;
     end
   end
@@ -1797,44 +1926,29 @@ begin
 end;
 
 procedure Decode_Group_15(PInst: PInstruction);
-var
-  P: PByte;
-  iMod, Reg: Byte;
 begin
   SetGroup(PInst);
   if (PInst^.OpTable <> tbTwoByte) and (PInst^.NextInst^ <> $AE) then
     SetInstError(PInst, INVALID_GROUP_OPCODE);
-  P := PInst^.NextInst;
-  Inc(P);
-  iMod := GetModRm_Mod(P^);
-  Reg := GetModRm_Reg(P^);
-  if (iMod = $03) and (PInst^.LID.MndPrf = $F3) and (Reg < $04) then
-  begin
-    Decode_NA_ModRm(PInst);
-    Exit;
-  end;
-  Decode_Invalid_Group(PInst);
+  { 0F AE: ALL forms carry a full ModRm. Previously only the F3 register
+    forms (rdfsbase ..) were decoded; the memory forms
+    (fxsave/ldmxcsr/stmxcsr/xsave/clflush ..) fell through to Invalid_Group
+    and lost their displacement - 0F AE 15 <disp32> became 3 instead of 7
+    bytes. The fence forms (lfence/mfence/sfence, mod=11) consume the same
+    single byte as before via Decode_ModRm. }
+  Decode_NA_ModRm(PInst);
 end;
 
 procedure Decode_Group_16(PInst: PInstruction);
-var
-  P: PByte;
-  iMod, Reg: Byte;
 begin
   SetGroup(PInst);
   if (PInst^.OpTable <> tbTwoByte) and (PInst^.NextInst^ <> $18) then
     SetInstError(PInst, INVALID_GROUP_OPCODE);
-  P := PInst^.NextInst;
-  Inc(P);
-  iMod := GetModRm_Mod(P^);
-  Reg := GetModRm_Reg(P^);
-  if (iMod <> $03) and (Reg < $04) then
-  begin
-    { Prefetch group instructions. }
-    Decode_NA_ModRm(PInst);
-    Exit;
-  end;
-  Decode_Invalid_Group(PInst);
+  { 0F 18-1F: prefetch and hint-NOP group. Even the "reserved" Reg/Mod
+    combinations decode their operands fully - 0F 1F is the compiler's
+    standard alignment NOP, 0F 19 A4 .. carries SIB+disp32. The old
+    restriction (only mod<>3 and reg<4) swallowed that. }
+  Decode_NA_ModRm(PInst);
 end;
 
 procedure Decode_Group_17(PInst: PInstruction);
@@ -1872,36 +1986,26 @@ end;
 
 procedure Decode_NA_ModRm(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
+  { Previously there was a guard here (and in all NA_* siblings) that
+    declared the instruction invalid when MndPrf was set and bailed out
+    AFTER the opcode. That was wrong: 66/F2/F3 before a two-byte or FPU
+    opcode without a prefix variant is an ordinary legacy prefix on the
+    hardware, the instruction stays valid (66 0F B6 = MOVZX r16,
+    66 0F 1F = alignment NOP, F3 D8 = FCOMP). The bailout swallowed
+    ModRm/Disp/Imm and produced wrong lengths - measured against Iced:
+    ~1400 mismatches in a single Delphi x64 exe alone. }
   SetOpCode(PInst);
   Decode_ModRm(PInst);
 end;
 
 procedure Decode_NA_Ib(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   Decode_Imm(PInst, ops8bits);
 end;
 
 procedure Decode_NA_Iz(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   Decode_Imm(PInst, PInst^.LID.zOpSize);
 end;
@@ -1909,8 +2013,7 @@ end;
 procedure Decode_NA_I64(PInst: PInstruction);
 begin
   { Instruction is invalid on PM64 }
-  { Only valid when mandatory prefix is : $00 }
-  if (PInst^.Archi = CPUX64) or ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
+  if PInst^.Archi = CPUX64 then
   begin
     Decode_InvalidOpCode(PInst);
     Exit;
@@ -1920,20 +2023,13 @@ end;
 
 procedure Decode_NA(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
 end;
 
 procedure Decode_NA_ModRm_I64(PInst: PInstruction);
 begin
   { Instruction is invalid on PM64 }
-  { Only valid when mandatory prefix is : $00 }
-  if (PInst^.Archi = CPUX64) or ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
+  if PInst^.Archi = CPUX64 then
   begin
     Decode_InvalidOpCode(PInst);
     Exit;
@@ -1944,12 +2040,6 @@ end;
 
 procedure Decode_NA_ModRm_Iz(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   Decode_ModRm(PInst);
   Decode_Imm(PInst, PInst^.LID.zOpSize);
@@ -1957,12 +2047,6 @@ end;
 
 procedure Decode_NA_ModRm_Ib(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   Decode_ModRm(PInst);
   Decode_Imm(PInst, ops8bits);
@@ -1970,12 +2054,6 @@ end;
 
 procedure Decode_NA_Jb_Df64(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   PInst^.OperandFlags := opdDf64;
   Decode_J(PInst, ops8bits);
@@ -1992,8 +2070,7 @@ end;
 procedure Decode_NA_Ib_I64(PInst: PInstruction);
 begin
   { Instruction is invalid on PM64 }
-  { Only valid when mandatory prefix is : $00 }
-  if (PInst^.Archi = CPUX64) or ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
+  if PInst^.Archi = CPUX64 then
   begin
     Decode_InvalidOpCode(PInst);
     Exit;
@@ -2007,7 +2084,12 @@ begin
   SetOpCode(PInst);
   PInst^.OpType := otCALL;
   PInst^.OperandFlags := opdDf64;
-  Decode_J(PInst, PInst^.LID.zOpSize);
+  { Near branches in 64-bit mode ignore 66: the offset stays rel32.
+    66 E8/E9/0F 8x was otherwise read as rel16 and 2 bytes too short. }
+  if PInst^.Archi = CPUX64 then
+    Decode_J(PInst, ops32bits)
+  else
+    Decode_J(PInst, PInst^.LID.zOpSize);
 end;
 
 procedure Decode_NA_JMP_Jz_Df64(PInst: PInstruction);
@@ -2015,7 +2097,11 @@ begin
   SetOpCode(PInst);
   PInst^.OpType := otJMP;
   PInst^.OperandFlags := opdDf64;
-  Decode_J(PInst, PInst^.LID.zOpSize);
+  { see Decode_NA_CALL_Jz_Df64: 66 has no effect on rel offsets in 64-bit mode }
+  if PInst^.Archi = CPUX64 then
+    Decode_J(PInst, ops32bits)
+  else
+    Decode_J(PInst, PInst^.LID.zOpSize);
 end;
 
 procedure Decode_NA_JMP_Ap_I64(PInst: PInstruction);
@@ -2295,24 +2381,12 @@ end;
 
 procedure Decode_NA_D64(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   PInst^.OperandFlags := opdD64;
 end;
 
 procedure Decode_NA_Iz_D64(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   PInst^.OperandFlags := opdD64;
   Decode_Imm(PInst, PInst^.LID.zOpSize);
@@ -2320,12 +2394,6 @@ end;
 
 procedure Decode_NA_Ib_D64(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   PInst^.OperandFlags := opdD64;
   Decode_Imm(PInst, ops8bits);
@@ -2347,12 +2415,6 @@ end;
 
 procedure Decode_NA_Iw_Ib_D64(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   PInst^.OperandFlags := opdD64;
   Decode_Imm(PInst, ops16bits);
@@ -2360,29 +2422,33 @@ begin
 end;
 
 procedure Decode_NA_ModRm_F64(PInst: PInstruction);
+var
+  PModRM: LPModRM;
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
+  { Only 0F 20-26 (MOV CR/DR/TR). The hardware ignores ModRm.Mod - the
+    instruction is always register form: exactly ONE ModRm byte, never SIB,
+    never displacement. 0F 20 54 .. is 3 bytes; Decode_ModRm would have read
+    the 54 as mod=01/rm=100 and pulled in SIB+disp8. }
   SetOpCode(PInst);
   PInst^.OperandFlags := opdF64;
-  Decode_ModRm(PInst);
+  PModRM := @PInst^.ModRm;
+  PModRM.Value := PInst^.NextInst^;
+  PModRM.iMod := GetModRm_Mod(PModRM.Value);
+  PModRM.Reg := GetModRm_Reg(PModRM.Value);
+  PModRM.Rm := GetModRm_Rm(PModRM.Value);
+  PModRM.Flags := mfUsed;
+  Inc(PInst^.NextInst);
 end;
 
 procedure Decode_NA_Jz_Df64(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and (PInst^.LID.MndPrf <> $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   PInst^.OperandFlags := opdDf64;
-  Decode_J(PInst, PInst^.LID.zOpSize);
+  { see Decode_NA_CALL_Jz_Df64: 66 has no effect on rel offsets in 64-bit mode }
+  if PInst^.Archi = CPUX64 then
+    Decode_J(PInst, ops32bits)
+  else
+    Decode_J(PInst, PInst^.LID.zOpSize);
 end;
 
 {
@@ -2429,12 +2495,6 @@ end;
 
 procedure Decode_NA_Iv(PInst: PInstruction);
 begin
-  { Only valid when mandatory prefix is : $00 }
-  if ((PInst^.OpTable <> tbOneByte) and not(PInst^.LID.MndPrf = $00)) then
-  begin
-    Decode_InvalidOpCode(PInst);
-    Exit;
-  end;
   SetOpCode(PInst);
   Decode_Imm(PInst, PInst^.LID.vOpSize);
 end;

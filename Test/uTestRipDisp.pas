@@ -521,12 +521,8 @@ end;
 
 procedure TPatchAreaTests.LoopIntoPatchArea_IsRefused;
 begin
-  Assert.WillRaise(
-    procedure
-    begin
-      InterceptCreate(@LoopIntoPatchArea, @DummyInt);
-    end,
-    Exception,
+  // Refusal = nil, not an exception (see ShortJmpIntoOwnBody_IsRefused).
+  Assert.IsNull(InterceptCreate(@LoopIntoPatchArea, @DummyInt),
     'a loop target inside the patch area must be refused, not patched');
 end;
 
@@ -545,12 +541,11 @@ end;
 
 procedure TPatchAreaTests.ShortJmpIntoOwnBody_IsRefused;
 begin
-  Assert.WillRaise(
-    procedure
-    begin
-      InterceptCreate(@ShortJmpIntoOwnBody, @DummyInt);
-    end,
-    Exception,
+  // nil, NOT an exception: a profiler refuses hundreds of functions as a
+  // matter of course, and every exception raised inside the target pops up a
+  // dialog under a debugger (measured: attaching to an exe running in the
+  // Delphi IDE).
+  Assert.IsNull(InterceptCreate(@ShortJmpIntoOwnBody, @DummyInt),
     'GetRoot followed the entry JMP into the function body - the hook then ' +
     'sits inside the loop and is entered once per iteration for a single return');
 end;

@@ -1586,6 +1586,11 @@ var
   L: ShortInt;
   ImmSize: Integer;
   k: Integer;
+const
+  { sub rsp,8 | push rsi | mov rsi,imm64 | mov rsi,[rsi] | mov [rsp+8],rsi |
+    pop rsi | ret  ==  jmp qword ptr [<imm64>], clobbering nothing. }
+  JmpMemThunk: array [0 .. 24] of Byte = ($48, $83, $EC, $08, $56, $48, $BE, 0,
+    0, 0, 0, 0, 0, 0, 0, $48, $8B, $36, $48, $89, $74, $24, $08, $5E, $C3);
 begin
   pFrst := NewAddr;
   P := PInst^.NextInst;
@@ -1622,6 +1627,32 @@ begin
     if PInst^.ModRm.Flags and mfUsed <> 0 then
     begin
       Assert(PInst^.Disp.Flags and dfRip <> 0);
+{$IFDEF CPUX64}
+      { The PUSH/POP scratch pair below only works for an instruction that
+        FALLS THROUGH to the POP and leaves RSP alone. An indirect branch does
+        neither: control leaves at the JMP, the pushed register stays on the
+        stack, and the RET of the jumped-to routine takes it for its return
+        address (measured: AV at whatever the caller happened to have in RSI).
+        Delphi import thunks are exactly this instruction - JMP qword ptr
+        [rip+<IAT slot>] - so this is not a theoretical case.
+        Rebuild it through a stack slot instead: RSP and every register end up
+        as the original JMP left them, stack arguments of the tail-jumped-to
+        routine included. }
+      if PInst^.OpType = otJMP then
+      begin
+        Move(JmpMemThunk[0], NewAddr^, SizeOf(JmpMemThunk));
+        PUInt64(NativeInt(NewAddr) + 7)^ := UInt64(P); { mov rsi,<slot> }
+        Inc(NewAddr, SizeOf(JmpMemThunk));
+        Result := (NativeInt(NewAddr) - NativeInt(pFrst));
+        Exit;
+      end;
+      { CALL/PUSH/POP through the operand cannot be rebuilt the same way: the
+        callee needs RSP untouched for its stack arguments, PUSH/POP would
+        take the scratch value with them. Refusing beats corrupting. }
+      if (PInst^.OpType = otCALL) or (PInst^.OpCode = $8F) or
+        ((PInst^.OpCode = $FF) and (PInst^.ModRm.Reg = 6)) then
+        raise InterceptException.Create(SErrorRipDisp);
+{$ENDIF CPUX64}
       if PInst^.ModRm.Reg = rReg then
         rReg := rEDI;
 
@@ -2306,7 +2337,16 @@ begin
   end;
 end;
 
-procedure InsertDescriptor(PAt: PByte; PDscr: PDescriptor);
+{
+  True  = descriptor installed, target patched.
+  False = function is NOT patchable (too small, trampoline too big, branch into
+          the patch area). Deliberately WITHOUT an exception: under a debugger
+          EVERY exception raised inside the target pops up a notification
+          dialog, and a profiler refuses hundreds of functions as a matter of
+          course (measured: attaching to an exe running in the Delphi IDE =
+          one dialog per refused function). Callers check for nil anyway.
+}
+function InsertDescriptor(PAt: PByte; PDscr: PDescriptor): Boolean;
 const
   { JMP from Target to Code Entry }
   kJmpCE = 1;
@@ -2334,6 +2374,7 @@ var
   PExMem: PByte;
   LPExMem: PByte;
 begin
+  Result := True;
   Sb := 0;
   P := PAt;
   PDscr^.OrgPtr := P;
@@ -2397,7 +2438,10 @@ begin
         end;
 
       if ( Sb < JmpSize ) then
-        raise InterceptException.Create(SErrorSmallFunctionSize);
+        begin
+        FreeTrampoBlock(LPExMem);             { SErrorSmallFunctionSize }
+        Exit(False);
+        end;
       Break;
       end;
     Inst.Addr := Inst.NextInst;
@@ -2405,12 +2449,18 @@ begin
   end;
 
   if Sb > TrampoSize then
-    raise InterceptException.Create(SErrorBigTrampoSize);
+  begin
+    FreeTrampoBlock(LPExMem);                 { SErrorBigTrampoSize }
+    Exit(False);
+  end;
 
   { Refuse before touching the target: see BranchIntoPatchArea. }
   BrOfs := BranchIntoPatchArea(P, Sb);
   if BrOfs >= 0 then
-    raise InterceptException.CreateFmt(SErrorBranchIntoPatch, [Sb, BrOfs]);
+  begin
+    FreeTrampoBlock(LPExMem);                 { SErrorBranchIntoPatch }
+    Exit(False);
+  end;
 
   { Trampoline momory }
   T := PExMem;
@@ -2611,7 +2661,11 @@ begin
     P := GetRoot(TargetProc);
     PDscr := CreateNewDescriptor();
     try
-      InsertDescriptor(P, PDscr);
+      if not InsertDescriptor(P, PDscr) then
+      begin
+        FreeMem(PDscr);
+        Exit(nil);                { not patchable - not an error, no raise }
+      end;
     except
       FreeMem(PDscr);
       raise;

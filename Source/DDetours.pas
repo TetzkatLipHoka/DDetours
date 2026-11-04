@@ -220,6 +220,11 @@ function HookImportFunctionByName(hModule: THandle; pLibName: PAnsiChar; pFuncti
 function HookImportFunction(hModule: THandle; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer): Pointer; overload;
 function HookImportFunctionByName(pModule: PAnsiChar; pLibName: PAnsiChar; pFunction: PAnsiChar; pNewFunction: Pointer): Pointer; overload;
 function HookImportFunction(pModule: PAnsiChar; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer): Pointer; overload;
+{ Like HookImportFunction(hModule, ...), but patches the slots of pFunction in EVERY import
+  descriptor of pLibName (the Delphi linker emits several per DLL; FindImportLibrary only
+  returns the first). Returns the number of patched slots, at most MaxCount. }
+function HookImportFunctionAll(hModule: THandle; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer;
+  MaxCount: Integer = MaxInt): Integer;
 
 function FindDelayImportLibrary(hModule: THandle; pLibName: PAnsiChar): Pointer;
 function FindDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; pFuncName: PAnsiChar): PPointer; overload;
@@ -237,6 +242,72 @@ type
   TDefaultConstructor = function(InstanceOrVMT: Pointer; Alloc: ShortInt; Arg: Integer): Pointer;
 
   DetourException = Exception;
+
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+{
+  Plain code patching (formerly FastRTL's MinDetours unit).
+
+  The routines below REPLACE a function outright: a 5-byte E9 rel32 jump is
+  written over the target's entry and nothing of the original ever runs again
+  until UnhookProc puts the saved bytes back. No trampoline, no thread suspend,
+  no transaction, no descriptor - the patch is exactly 5 bytes and the backup
+  lives in the caller's TXRedirCode. Use InterceptCreate instead whenever the
+  replacement has to call the original.
+
+  x64: an E9 jump reaches +-2 GB only. When the replacement lies further away
+  (RTL in a runtime package, DLL based above 4 GB), the 5-byte patch goes to a
+  relay slot allocated near the target, which holds a 14-byte absolute jump
+  (FF 25 00000000 + imm64) on to the replacement. If no slot can be placed in
+  reach the hook is skipped and the original stays in place.
+}
+type
+  PXRedirCode = ^TXRedirCode;
+  TXRedirCode = packed record
+    Jump: Byte;
+    Offset: Integer;
+  end;
+
+const
+  DEFAULT_XRedirCode: TXRedirCode = (Jump: 0; Offset: 0);
+
+{ Follows a FF25 import thunk (jmp [slot]) to the routine it imports. Unlike
+  the hook engine's GetRoot this is what a full replacement wants: the routine
+  itself, also when it lives in a runtime package. }
+function GetActualAddr(Proc: Pointer): Pointer;
+{ True if an E9 rel32 jump placed at SourceProc reaches DestProc. Always True on x86. }
+function RelJumpFits(SourceProc, DestProc: Pointer): Boolean;
+{ Permanent redirect, no backup. }
+procedure CodeRedirect(SourceProc, DestProc: Pointer);
+{ Number of successful code/VMT/DMT/import writes of this unit (HookProc, UnhookProc,
+  ReplaceCode, ReplaceVmtField, ReplaceDynamicMethod, PatchImportFunction, InterceptCreate,
+  InterceptRemove). For self tests: an Initialize that wrote nothing did not install. }
+var
+  DDetoursPatchWrites: Integer = 0;
+
+{ Overwrites Size bytes at DestProc with the code at SourceProc; Backup (if given) receives the old bytes. }
+function ReplaceCode(DestProc, SourceProc: Pointer; Size: Cardinal; Backup: Pointer = nil): Boolean;
+{ Redirect with backup. BackupCode.Jump = 0 afterwards means "not hooked". }
+procedure HookProc(SourceProc, DestProc: Pointer; var BackupCode: TXRedirCode);
+procedure UnhookProc(SourceProc: Pointer; var BackupCode: TXRedirCode);
+
+procedure ReplaceVmtField(AClass: TClass; OldProc, NewProc: Pointer);
+{$IFNDEF FPC}
+function GetDynamicMethod(AClass: TClass; Index: Integer): Pointer;
+function ReplaceDynamicMethod(AClass: TClass; Index: Word; NewProc: Pointer): Pointer;
+{$ENDIF !FPC}
+{ Target of the Index-th CALL rel32 / MOV EAX,imm32 / MOV RAX,imm64 in a compiler generated stub. }
+function GetAddressFromCallStub(AStub: Pointer; Index: Integer = 0): Pointer;
+
+{$IFDEF FASTRTL_VERIFY_PATCH_SITE}
+{
+  Optional patch-site verification for HookProc, CodeRedirect and ReplaceCode
+  (define it PROJECT-WIDE in a test/debug build, Assertions on). Each write
+  path first asserts that the target really holds >= Size bytes of whole
+  instructions, so a too-short target (patch would spill into the adjacent
+  function or padding) fails loudly instead of silently corrupting code.
+}
+function IsPatchSafe(Proc: Pointer; Size: Cardinal): Boolean;
+{$ENDIF FASTRTL_VERIFY_PATCH_SITE}
 
 implementation
 
@@ -2312,11 +2383,21 @@ begin
   Inst.NextInst := P;
   Inst.VirtualAddr := nil;
   Scanned := 0;
+  { The scan runs up to 1 KB past the end of the function, across padding and
+    data bytes (jump tables!), where it regularly meets something the decoder
+    does not know (EVEX/AVX-512, garbage). With RaiseExceptionOnError,
+    SetInstError would then raise an InstException right inside InterceptCreate;
+    under a debugger that is one notification dialog per function (measured:
+    x64 target with AVX code, attaching from the IDE). A decode error ends the
+    best-effort scan like a RET instead. }
+  RaiseExceptionOnError := False;
+  try
   while Scanned < kMaxScan do
   begin
     Inst.Addr := Inst.NextInst;
+    Inst.Errors := NO_ERROR;
     Sz := fDecodeInst(@Inst);
-    if Sz <= 0 then
+    if (Sz <= 0) or (Inst.Errors <> NO_ERROR) then
       Break;
     Inc(Scanned, Sz);
 
@@ -2334,6 +2415,9 @@ begin
 
     if Inst.OpType = otRET then
       Break;
+  end;
+  finally
+    RaiseExceptionOnError := True;
   end;
 end;
 
@@ -2440,7 +2524,9 @@ begin
       if ( Sb < JmpSize ) then
         begin
         FreeTrampoBlock(LPExMem);             { SErrorSmallFunctionSize }
-        Exit(False);
+        { Exit(value) needs D2009+ - written out for the D7 build }
+        Result := False;
+        Exit;
         end;
       Break;
       end;
@@ -2451,7 +2537,8 @@ begin
   if Sb > TrampoSize then
   begin
     FreeTrampoBlock(LPExMem);                 { SErrorBigTrampoSize }
-    Exit(False);
+    Result := False;
+    Exit;
   end;
 
   { Refuse before touching the target: see BranchIntoPatchArea. }
@@ -2459,7 +2546,8 @@ begin
   if BrOfs >= 0 then
   begin
     FreeTrampoBlock(LPExMem);                 { SErrorBranchIntoPatch }
-    Exit(False);
+    Result := False;
+    Exit;
   end;
 
   { Trampoline momory }
@@ -2664,7 +2752,8 @@ begin
       if not InsertDescriptor(P, PDscr) then
       begin
         FreeMem(PDscr);
-        Exit(nil);                { not patchable - not an error, no raise }
+        Result := nil;            { not patchable - not an error, no raise }
+        Exit;
       end;
     except
       FreeMem(PDscr);
@@ -2764,6 +2853,8 @@ function InterceptCreate(const TargetProc, InterceptProc: Pointer; const Param: 
   const Options: TInterceptOptions = DefaultInterceptOptions): Pointer;
 begin
   Result := InstallHook(TargetProc, InterceptProc, Param, Options);
+  if Result <> nil then
+    Inc(DDetoursPatchWrites);
 end;
 
 function InterceptCreate(const TargetInterface; MethodIndex: Integer; const InterceptProc: Pointer; const Param: Pointer = nil;
@@ -2830,7 +2921,11 @@ end;
 function InterceptRemove(const TrampoLine: Pointer): Integer;
 begin
   if Assigned(TrampoLine) then
-    Result := RemoveHook(TrampoLine)
+  begin
+    Result := RemoveHook(TrampoLine);
+    if Result >= 0 then
+      Inc(DDetoursPatchWrites);
+  end
   else
     Result := -1;
 end;
@@ -3259,6 +3354,7 @@ begin
     begin
     Result := pCallbackFunction^;
     pCallbackFunction^ := pNewFunction;
+    Inc(DDetoursPatchWrites);
     InternalFuncs.VirtualProtect(pCallbackFunction, SizeOf(Pointer), dwOldProtect, dwOldProtect);
     end
   else
@@ -3385,6 +3481,53 @@ begin
   result := FindImportLibrary( GetModuleHandleA( pModule ), pLibName );
   if ( result <> nil ) then
     result := HookImportFunction( result, pFunction, pNewFunction );
+end;
+
+{$IF NOT Declared( PIMAGE_IMPORT_DESCRIPTOR )}
+type
+  TFRImportDescriptor = record
+    OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk: DWORD;
+  end;
+  PFRImportDescriptor = ^TFRImportDescriptor;
+{$ELSE}
+type
+  PFRImportDescriptor = PIMAGE_IMPORT_DESCRIPTOR;
+{$IFEND}
+
+function HookImportFunctionAll(hModule: THandle; pLibName: PAnsiChar; pFunction: Pointer; pNewFunction: Pointer;
+  MaxCount: Integer): Integer;
+var
+  pEnd: PByte;
+  pImpDir: PImageDataDirectory;
+  pImpDesc: PFRImportDescriptor;
+  pModule: PAnsiChar absolute hModule;
+  pSlot: PPointer;
+begin
+  Result := 0;
+  if ( pFunction = nil ) or ( MaxCount <= 0 ) then
+    Exit;
+  pImpDesc := FindImageDirectory(hModule, IMAGE_DIRECTORY_ENTRY_IMPORT, pImpDir);
+  if pImpDesc = nil then
+    Exit;
+  pEnd := PByte( PAnsiChar(pImpDesc) + pImpDir^.Size );
+  while (PAnsiChar(pImpDesc) < pEnd) and (pImpDesc^.FirstThunk <> 0) do
+  begin
+    if lstrcmpiA(@pModule[pImpDesc^.Name], pLibName) = 0 then
+    begin
+      pSlot := PPointer(@pModule[pImpDesc^.FirstThunk]);
+      while pSlot^ <> nil do
+      begin
+        if ( pSlot^ = pFunction ) and ( PatchImportFunction( pSlot, pNewFunction ) <> nil ) then
+        begin
+          Inc( Result );
+          if Result >= MaxCount then
+            Exit;
+        end;
+        Inc( pSlot );
+      end;
+    end;
+    Inc(pImpDesc);
+  end;
 end;
 
 function FindDelayImportLibrary(hModule: THandle; pLibName: PAnsiChar): Pointer;
@@ -3539,6 +3682,434 @@ begin
   Result := FindDelayImportFunction(hModule, DllName, Ordinal);
   if (Result <> nil) then
     Result := PatchImportFunction(Result, pNewFunction);
+end;
+
+{ ===================================== Plain code patching ===================================== }
+
+const
+  CurrentProcess_ = THandle(-1); // current-process pseudo-handle; MUST be pointer-wide
+    // (THandle) - on Win64 a 32-bit Cardinal(-1) is zero-extended to $00000000FFFFFFFF,
+    // an INVALID handle, so VirtualProtectEx/Write/ReadProcessMemory silently fail and
+    // every hook no-ops. THandle(-1) = $FFFFFFFF on Win32, $FFFFFFFFFFFFFFFF on Win64.
+
+{$IFDEF FASTRTL_VERIFY_PATCH_SITE}
+function IsPatchSafe(Proc: Pointer; Size: Cardinal): Boolean;
+// True if the first whole instructions at Proc cover at least Size bytes, i.e. an
+// instruction boundary lands at or beyond Size and no end-of-body (RET/JMP/INT3-
+// padding) is reached before it. False on any decode error or a too-short body.
+// Conservative by design: a false "unsafe" only trips an assert for human review;
+// a false "safe" would be the dangerous outcome, so ambiguous streams return False.
+var
+  Inst: TInstruction;
+  Consumed: Cardinal;
+  SavedRaise: Boolean;
+  EndOfBody: Boolean;
+begin
+  Result := False;
+  if (Proc = nil) or (Size = 0) then
+    Exit;
+
+  SavedRaise := RaiseExceptionOnError;
+  RaiseExceptionOnError := False; // we want a boolean verdict, not an InstException
+  try
+    FillChar(Inst, SizeOf(Inst), 0);
+    Inst.Archi := CPUX;
+    Inst.NextInst := Proc;
+    Consumed := 0;
+
+    while Consumed < Size do
+    begin
+      Inst.Addr := Inst.NextInst;
+      DecodeInst(@Inst);
+
+      // A decode error or a zero-length instruction means we cannot trust the byte
+      // stream to be code - refuse rather than guess.
+      if (Inst.Errors <> NO_ERROR) or (Inst.InstSize <= 0) then
+        Exit;
+
+      Inc(Consumed, Cardinal(Inst.InstSize));
+
+      // End of the straight-line body: RET, INT3 padding, or an UNCONDITIONAL jmp
+      // (otJMP bit set, otJcc bit clear so conditional jumps don't count - execution
+      // falls through those). If the body ends before we have covered Size bytes the
+      // target is shorter than the patch => unsafe.
+      EndOfBody := (Inst.OpType = otRET) or (Inst.OpType = otINT3) or
+        ((Inst.OpType and otJMP <> 0) and (Inst.OpType and otJcc = 0));
+      if EndOfBody then
+      begin
+        Result := Consumed >= Size;
+        Exit;
+      end;
+    end;
+
+    Result := True;
+  finally
+    RaiseExceptionOnError := SavedRaise;
+  end;
+end;
+
+procedure CheckPatchSite(Proc: Pointer; Size: Cardinal; const What: string);
+begin
+  if not IsPatchSafe(Proc, Size) then
+    Assert(False, Format('DDetours: unsafe patch site in %s - target @%p ' +
+      'has fewer than %d bytes of whole instructions (patch would clobber adjacent code)',
+      [What, Proc, Size]));
+end;
+{$ENDIF FASTRTL_VERIFY_PATCH_SITE}
+
+function GetActualAddr(Proc: Pointer): Pointer;
+type
+  PWin9xDebugThunk = ^TWin9xDebugThunk;
+  TWin9xDebugThunk = packed record
+    PUSH: Byte;
+    Addr: Pointer;
+    JMP: TXRedirCode;
+  end;
+
+  PAbsoluteIndirectJmp = ^TAbsoluteIndirectJmp;
+  TAbsoluteIndirectJmp = packed record
+    OpCode: Word; // $FF25 (jmp, FF /4)
+    Addr: PPointer;
+  end;
+begin
+  if Proc <> nil then
+  begin
+    if (Win32Platform <> VER_PLATFORM_WIN32_NT) and
+      (PWin9xDebugThunk(Proc).PUSH = $68) and (PWin9xDebugThunk(Proc).JMP.Jump = $E9) then
+      Proc := PWin9xDebugThunk(Proc).Addr;
+
+    if (PAbsoluteIndirectJmp(Proc).OpCode = opJmpMem) then
+{$IFDEF CPUX64}
+      // x64: FF25 is jmp [rip+disp32] - RIP-relative, RIP = next instruction
+      // (Proc+6). Import thunks of runtime-package builds look like this; decoding
+      // disp32 as an absolute pointer (the x86 form) would yield garbage.
+      Result := PPointer(PAnsiChar(Proc) + 6 + PInteger(PAnsiChar(Proc) + 2)^)^
+{$ELSE !CPUX64}
+      Result := PAbsoluteIndirectJmp(Proc).Addr^
+{$ENDIF CPUX64}
+    else
+      Result := Proc;
+  end
+  else
+    Result := nil;
+end;
+
+function RelJumpFits(SourceProc, DestProc: Pointer): Boolean;
+{$IFDEF CPUX64}
+var
+  D: Int64;
+begin
+  D := Int64(NativeInt(DestProc)) - (NativeInt(SourceProc) + SizeOf(TXRedirCode));
+  Result := (D >= Low(Integer)) and (D <= High(Integer));
+end;
+{$ELSE !CPUX64}
+begin
+  Result := True;
+end;
+{$ENDIF CPUX64}
+
+{$IFDEF CPUX64}
+const
+  RelaySignature = $59414C52; // 'RLAY', right behind the 14-byte jump
+
+{
+  Relay for an E9 patch whose destination is out of rel32 reach. The slot comes
+  from the trampoline pool (AllocTrampoBlock places pools near the requested
+  address), but the pool may fall back to an arbitrary address when nothing
+  free is close - so reach is checked again and nil means "cannot hook".
+}
+function AllocRelay(SourceProc, DestProc: Pointer): Pointer;
+begin
+  Result := AllocTrampoBlock(SourceProc);
+  if not Assigned(Result) then
+    Exit;
+  if not RelJumpFits(SourceProc, Result) then
+  begin
+    FreeTrampoBlock(Result);
+    Result := nil;
+    Exit;
+  end;
+  InsertJmp(Result, DestProc, JT_RIPZ); // FF 25 00000000 + imm64 = 14 bytes
+  PCardinal(PByte(Result) + 14)^ := RelaySignature;
+  InternalFuncs.FlushInstructionCache(CurrentProcess_, Result, 18);
+end;
+
+{ Frees the relay an E9 patch at SourceProc points to, if it points to one of ours. }
+procedure FreeRelay(SourceProc: Pointer);
+var
+  P: PByte;
+begin
+  if PByte(SourceProc)^ <> $E9 then
+    Exit;
+  P := PByte(NativeInt(SourceProc) + SizeOf(TXRedirCode) + PInteger(PByte(SourceProc) + 1)^);
+  if (PWord(P)^ = opJmpMem) and (PCardinal(P + 2)^ = 0) and (PCardinal(P + 14)^ = RelaySignature) then
+  begin
+    PCardinal(P + 14)^ := 0;
+    FreeTrampoBlock(P);
+  end;
+end;
+{$ENDIF CPUX64}
+
+{ Where the E9 at SourceProc has to jump to reach DestProc: DestProc itself,
+  a relay (x64, out of reach), or nil if neither works. }
+function JumpTarget(SourceProc, DestProc: Pointer): Pointer;
+begin
+  if RelJumpFits(SourceProc, DestProc) then
+    Result := DestProc
+  else
+{$IFDEF CPUX64}
+    Result := AllocRelay(SourceProc, DestProc);
+{$ELSE !CPUX64}
+    Result := nil;
+{$ENDIF CPUX64}
+end;
+
+procedure CodeRedirect(SourceProc, DestProc: Pointer);
+var
+  OldProtect: Cardinal;
+begin
+  if SourceProc = nil then
+    Exit;
+  SourceProc := GetActualAddr(SourceProc);
+  Assert(SourceProc <> nil);
+{$IFDEF FASTRTL_VERIFY_PATCH_SITE}
+  CheckPatchSite(SourceProc, SizeOf(TXRedirCode), 'CodeRedirect');
+{$ENDIF FASTRTL_VERIFY_PATCH_SITE}
+  DestProc := JumpTarget(SourceProc, DestProc);
+  if DestProc = nil then
+    Exit;
+
+  if VirtualProtectEx(CurrentProcess_, SourceProc, SizeOf(TXRedirCode), PAGE_EXECUTE_READWRITE, OldProtect) then
+  begin
+    TXRedirCode(SourceProc^).Jump := $E9;
+    TXRedirCode(SourceProc^).Offset := PAnsiChar(DestProc) - (PAnsiChar(SourceProc) + SizeOf(TXRedirCode));
+    VirtualProtectEx(CurrentProcess_, SourceProc, SizeOf(TXRedirCode), OldProtect, @OldProtect);
+    FlushInstructionCache(CurrentProcess_, SourceProc, SizeOf(TXRedirCode));
+  end;
+end;
+
+function ReplaceCode(DestProc, SourceProc: Pointer; Size: Cardinal; Backup: Pointer = nil): Boolean;
+var
+  n: NativeUInt;
+begin
+  DestProc := GetActualAddr(DestProc);
+{$IFDEF FASTRTL_VERIFY_PATCH_SITE}
+  // Verify only the INSTALL direction. ReplaceCode is bidirectional: callers pass
+  // Backup<>nil when installing (capture the pristine body, then overwrite it with
+  // the new blob) and Backup=nil when RESTORING (write the saved original bytes back
+  // over the already-patched site). At restore time the bytes there are the blob
+  // (which legitimately ends in a RET before Size) and the region was already
+  // validated at install - checking it would false-alarm.
+  if (Backup <> nil) and (DestProc <> nil) then
+    CheckPatchSite(DestProc, Size, 'ReplaceCode (install)');
+{$ENDIF FASTRTL_VERIFY_PATCH_SITE}
+  if (Backup <> nil) then
+    // the backup read doubles as a validity check: if DestProc is not readable
+    // for Size bytes (bad address, too-small target at a page boundary) RPM fails
+    // and we do NOT write.
+    Result := ReadProcessMemory(CurrentProcess_, DestProc, Backup, Size, n) and (n = Size)
+  else
+    Result := True;
+
+  if Result then
+  begin
+    Result := (DestProc <> nil) and (SourceProc <> nil) and
+      WriteProcessMemory(CurrentProcess_, DestProc, SourceProc, Size, n) and (n = Size);
+    if Result then
+    begin
+      FlushInstructionCache(CurrentProcess_, DestProc, Size);
+      Inc(DDetoursPatchWrites);
+    end;
+  end;
+end;
+
+procedure HookProc(SourceProc, DestProc: Pointer; var BackupCode: TXRedirCode);
+var
+  n: NativeUInt;
+  Code: TXRedirCode;
+  Target: Pointer;
+begin
+  if SourceProc = nil then
+    Exit;
+  SourceProc := GetActualAddr(SourceProc);
+  Assert(SourceProc <> nil);
+  // WARNING: this writes 5 bytes ($E9 rel32) over the prologue without checking
+  // that the target is at least 5 bytes long; a shorter target would clobber the
+  // adjacent code. FASTRTL_VERIFY_PATCH_SITE checks exactly that in test builds.
+{$IFDEF FASTRTL_VERIFY_PATCH_SITE}
+  CheckPatchSite(SourceProc, SizeOf(Code), 'HookProc');
+{$ENDIF FASTRTL_VERIFY_PATCH_SITE}
+  Target := JumpTarget(SourceProc, DestProc);
+  if Target = nil then
+  begin
+    BackupCode.Jump := 0; // not hooked -> UnhookProc is a no-op
+    Exit;
+  end;
+  if ReadProcessMemory(CurrentProcess_, SourceProc, @BackupCode, SizeOf(BackupCode), n)
+    and (n = SizeOf(BackupCode)) then
+  begin
+    Code.Jump := $E9;
+    Code.Offset := PAnsiChar(Target) - PAnsiChar(SourceProc) - SizeOf(Code);
+    if WriteProcessMemory(CurrentProcess_, SourceProc, @Code, SizeOf(Code), n) then
+    begin
+      FlushInstructionCache(CurrentProcess_, SourceProc, SizeOf(Code));
+      Inc(DDetoursPatchWrites);
+    end
+    else
+      BackupCode.Jump := 0;
+  end
+  else
+    BackupCode.Jump := 0;
+{$IFDEF CPUX64}
+  if (BackupCode.Jump = 0) and (Target <> DestProc) then
+    FreeTrampoBlock(Target); // the relay never got used
+{$ENDIF CPUX64}
+end;
+
+procedure UnhookProc(SourceProc: Pointer; var BackupCode: TXRedirCode);
+var
+  n: NativeUInt;
+begin
+  if (BackupCode.Jump = 0) or (SourceProc = nil) then
+    Exit;
+
+  SourceProc := GetActualAddr(SourceProc);
+  Assert(SourceProc <> nil);
+
+{$IFDEF CPUX64}
+  FreeRelay(SourceProc);
+{$ENDIF CPUX64}
+  if WriteProcessMemory(CurrentProcess_, SourceProc, @BackupCode, SizeOf(BackupCode), n) then
+  begin
+    FlushInstructionCache(CurrentProcess_, SourceProc, SizeOf(BackupCode));
+    Inc(DDetoursPatchWrites);
+  end;
+
+  BackupCode.Jump := 0;
+end;
+
+procedure ReplaceVmtField(AClass: TClass; OldProc, NewProc: Pointer);
+type
+  PVmt = ^TVmt;
+  TVmt = array [0 .. 0] of Pointer;
+var
+  I: Integer;
+  Vmt: PVmt;
+  n: NativeUInt;
+  P: Pointer;
+begin
+  OldProc := GetActualAddr(OldProc);
+  NewProc := GetActualAddr(NewProc);
+
+  I := vmtSelfPtr div SizeOf(Pointer);
+  Vmt := Pointer(AClass);
+{$IFOPT R+}
+{$DEFINE RANGECHECK_REENABLE}
+{$RANGECHECKS OFF}
+{$ENDIF}
+  while (I < 0) or (Vmt[I] <> nil) do
+  begin
+    P := Vmt[I];
+    if (P <> OldProc) and (Integer(P) > $10000) and not IsBadReadPtr(P, 6) then
+      P := GetActualAddr(P);
+    if P = OldProc then
+    begin
+      if WriteProcessMemory(CurrentProcess_, @Vmt[I], @NewProc, SizeOf(NewProc), n) then
+        Inc(DDetoursPatchWrites);
+      Exit;
+    end;
+    Inc(I);
+  end;
+{$IFDEF RANGECHECK_REENABLE}
+{$RANGECHECKS ON}
+{$UNDEF RANGECHECK_REENABLE}
+{$ENDIF}
+end;
+
+{$IFNDEF FPC}
+function GetDynamicMethod(AClass: TClass; Index: Integer): Pointer;
+{$IFDEF CPUX64}
+begin
+  { A pure asm CALL would enter the callee without shadow space on a misaligned
+    stack. nil if neither AClass nor a parent handles Index. }
+  Result := System.GetDynaMethod(AClass, Index);
+end;
+{$ELSE !CPUX64}
+asm
+  CALL System.@FindDynaClass
+end;
+{$ENDIF CPUX64}
+
+function ReplaceDynamicMethod(AClass: TClass; Index: Word; NewProc: Pointer): Pointer;
+// Swaps the entry for Index (message ID / dynamic index) in AClass's OWN dynamic
+// method table and returns the previous handler (nil if AClass itself declares
+// none). The original code stays untouched, so the returned pointer can be called
+// as the "inherited" handler; descendants without their own entry inherit the swap.
+// DMT layout: Word Count, Word Index[Count], Pointer Proc[Count].
+type
+  TWordArr = array [0 .. High(Word)] of Word;
+  TPtrArr = array [0 .. High(Word)] of Pointer;
+var
+  Dmt: PAnsiChar;
+  Count: Integer;
+  I: Integer;
+  Procs: ^TPtrArr;
+  n: NativeUInt;
+begin
+  Result := nil;
+  Dmt := PPointer(PAnsiChar(AClass) + vmtDynamicTable)^;
+  if Dmt = nil then
+    Exit;
+  Count := PWord(Dmt)^;
+  Procs := Pointer(Dmt + SizeOf(Word) + Count * SizeOf(Word));
+  for I := 0 to Count - 1 do
+    if TWordArr(Pointer(Dmt + SizeOf(Word))^)[I] = Index then
+    begin
+      Result := Procs^[I];
+      if not WriteProcessMemory(CurrentProcess_, @Procs^[I], @NewProc, SizeOf(Pointer), n) then
+        Result := nil
+      else
+        Inc(DDetoursPatchWrites);
+      Exit;
+    end;
+end;
+{$ENDIF !FPC}
+
+function GetAddressFromCallStub(AStub: Pointer; Index: Integer = 0): Pointer;
+begin
+  while (Index > 0) and (
+    (PByte(AStub)^ = $E8 { call } ) or
+    (PByte(AStub)^ = $B8 { mov eax } ){$IFDEF CPUX64} or
+    (PWord(AStub)^ = $B848 { mov rax } ){$ENDIF CPUX64}
+    ) do
+  begin
+    if (PByte(AStub)^ = $E8 { call } ) or (PByte(AStub)^ = $B8 { mov eax } ) then
+    begin
+      Inc(NativeUInt(AStub), 1 + SizeOf(Pointer));
+      Dec(Index);
+    end
+{$IFDEF CPUX64}
+    else if (PWord(AStub)^ = $B848 { mov rax } ) then
+    begin
+      Inc(NativeUInt(AStub), 2 + SizeOf(Pointer));
+      Dec(Index);
+    end
+{$ENDIF CPUX64}
+    else
+    begin
+      Result := nil;
+      Exit;
+    end;
+  end;
+
+  if (PByte(AStub)^ = $E8 { call } ) or (PByte(AStub)^ = $B8 { mov eax } ) then
+    Result := Pointer(PAnsiChar(AStub) + 1 + SizeOf(Pointer) + PInteger(PAnsiChar(AStub) + 1)^)
+{$IFDEF CPUX64}
+  else if (PWord(AStub)^ = $B848 { mov rax } ) then
+    Result := Pointer(PAnsiChar(AStub) + 2 + SizeOf(Pointer) + PInt64(PAnsiChar(AStub) + 2)^)
+{$ENDIF CPUX64}
+  else
+    Result := nil;
 end;
 
 { ======================================= Initialization ======================================= }

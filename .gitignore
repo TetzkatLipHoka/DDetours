@@ -55,3 +55,5 @@ __history/
 
 # Castalia statistics file
 *.stat
+# Output of Test/build_fpc.bat
+Test/fpc/

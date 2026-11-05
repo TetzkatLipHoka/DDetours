@@ -6,6 +6,11 @@
 
 unit LegacyTypes;
 
+{$IFDEF FPC}
+{ Without it FPC's Integer is 16 bits, and with it Int32 and PInt32 here. }
+{$MODE DELPHI}
+{$ENDIF FPC}
+
 interface
 
 {$I DDetoursDefs.inc}

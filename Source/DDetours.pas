@@ -3414,7 +3414,7 @@ begin
 
   pEnd := PByte( PAnsiChar(pImpDesc) + pImpDir^.Size );
 
-  while (PAnsiChar(pImpDesc) < pEnd) and (pImpDesc^.FirstThunk <> 0) do
+  while (PAnsiChar(pImpDesc) < PAnsiChar(pEnd)) and (pImpDesc^.FirstThunk <> 0) do
   begin
     if lstrcmpiA(@pModule[pImpDesc^.Name], pLibName) = 0 then
     begin
@@ -3510,7 +3510,7 @@ begin
   if pImpDesc = nil then
     Exit;
   pEnd := PByte( PAnsiChar(pImpDesc) + pImpDir^.Size );
-  while (PAnsiChar(pImpDesc) < pEnd) and (pImpDesc^.FirstThunk <> 0) do
+  while (PAnsiChar(pImpDesc) < PAnsiChar(pEnd)) and (pImpDesc^.FirstThunk <> 0) do
   begin
     if lstrcmpiA(@pModule[pImpDesc^.Name], pLibName) = 0 then
     begin
@@ -3550,7 +3550,7 @@ begin
 
   pEnd := PByte( PAnsiChar(pImpDesc) + pImpDir^.Size );
 
-  while (PAnsiChar(pImpDesc) < pEnd) and (pImpDesc^.DllNameRVA > 0) do
+  while (PAnsiChar(pImpDesc) < PAnsiChar(pEnd)) and (pImpDesc^.DllNameRVA > 0) do
     begin
     if lstrcmpiA(@pModule[pImpDesc^.DllNameRVA], pLibName) = 0 then
       begin
@@ -3575,6 +3575,20 @@ type
   PIMAGE_THUNK_DATA32 = ^_IMAGE_THUNK_DATA32;
   PIMAGE_THUNK_DATA = PIMAGE_THUNK_DATA32;
 {$IFEND}
+
+{$IFDEF FPC}
+{ FPC's windows unit nests these fields in a u1 member. Pointer-sized, so that
+  Inc() steps over a whole slot on Win32 and Win64. }
+type
+  _DDETOURS_THUNK_DATA = record
+    case Byte of
+      0: (ForwarderString: NativeUInt);
+      1: (_Function: NativeUInt);
+      2: (Ordinal: NativeUInt);
+      3: (AddressOfData: NativeUInt);
+  end;
+  PIMAGE_THUNK_DATA = ^_DDETOURS_THUNK_DATA;
+{$ENDIF FPC}
 
 function FindDelayImportFunction(hModule: THandle; pImpDesc: PIMAGE_DELAYLOAD_DESCRIPTOR; pFuncName: PAnsiChar): PPointer;
 {$IF NOT Declared( PIMAGE_IMPORT_BY_NAME )}
@@ -3879,7 +3893,7 @@ begin
   if DestProc = nil then
     Exit;
 
-  if VirtualProtectEx(CurrentProcess_, SourceProc, SizeOf(TXRedirCode), PAGE_EXECUTE_READWRITE, OldProtect) then
+  if VirtualProtectEx(CurrentProcess_, SourceProc, SizeOf(TXRedirCode), PAGE_EXECUTE_READWRITE, @OldProtect) then
   begin
     TXRedirCode(SourceProc^).Jump := $E9;
     TXRedirCode(SourceProc^).Offset := PAnsiChar(DestProc) - (PAnsiChar(SourceProc) + SizeOf(TXRedirCode));
@@ -3993,15 +4007,20 @@ type
   PVmt = ^TVmt;
   TVmt = array [0 .. 0] of Pointer;
 var
-  I: Integer;
+  I: NativeInt;
   Vmt: PVmt;
   n: NativeUInt;
   P: Pointer;
+  OrgAccess: DWORD;
 begin
   OldProc := GetActualAddr(OldProc);
   NewProc := GetActualAddr(NewProc);
 
+{$IFDEF FPC}
+  I := vmtMethodStart div SizeOf(Pointer); // FPC has no entries below the VMT pointer
+{$ELSE !FPC}
   I := vmtSelfPtr div SizeOf(Pointer);
+{$ENDIF FPC}
   Vmt := Pointer(AClass);
 {$IFOPT R+}
 {$DEFINE RANGECHECK_REENABLE}
@@ -4010,12 +4029,16 @@ begin
   while (I < 0) or (Vmt[I] <> nil) do
   begin
     P := Vmt[I];
-    if (P <> OldProc) and (Integer(P) > $10000) and not IsBadReadPtr(P, 6) then
+    if (P <> OldProc) and (NativeUInt(P) > $10000) and not IsBadReadPtr(P, 6) then
       P := GetActualAddr(P);
     if P = OldProc then
     begin
+      { Delphi keeps the VMT in the code section, FPC in a read-only one, where
+        WriteProcessMemory fails with ERROR_NOACCESS. }
+      OrgAccess := SetMemPermission(@Vmt[I], SizeOf(Pointer), PAGE_EXECUTE_READWRITE);
       if WriteProcessMemory(CurrentProcess_, @Vmt[I], @NewProc, SizeOf(NewProc), n) then
         Inc(DDetoursPatchWrites);
+      SetMemPermission(@Vmt[I], SizeOf(Pointer), OrgAccess);
       Exit;
     end;
     Inc(I);

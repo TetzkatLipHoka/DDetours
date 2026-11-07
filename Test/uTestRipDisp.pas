@@ -91,6 +91,11 @@ type
     // entry is a short JMP into the own body: GetRoot must NOT follow it,
     // otherwise the hook lands inside the loop and the refusal never happens
     [Test] procedure ShortJmpIntoOwnBody_IsRefused;
+    // a RET sits between the entry and the branch back into the patch: the
+    // scan must look past it, or the patch breaks the second iteration
+    [Test] procedure LoopBehindEarlyRet_IsRefused;
+    // same layout but the loop head is past the patch -> must still hook
+    [Test] procedure EarlyRetLoopBeyondPatch_IsHooked;
   end;
 
   {
@@ -364,6 +369,60 @@ asm
   db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
 end;
 
+{
+  A while loop with an Exit in its body: the loop's RET comes BEFORE the branch
+  back to the loop head, so a scan that stops at the first RET never sees it.
+
+  Taken verbatim from a Win32 Delphi 12.3 build of map2pdb,
+  TDictionary<string,TDebugInfoSourceFile>.TValueEnumerator.MoveNext. Hooked, it
+  killed the target even with a single hook and no recording. The instruction
+  lengths are the same in 64 bit mode (4A becomes a REX prefix of the CMP).
+  Raw bytes for the same reason as above. Never called.
+}
+function LoopBehindEarlyRet: Integer;
+asm
+  db $EB,$18                                   // +00 jmp +1A (the condition)
+  db $FF,$40,$08                               // +02 loop head <- inside patch
+  db $8B,$50,$08
+  db $8D,$14,$52
+  db $8B,$48,$04
+  db $8B,$49,$04
+  db $83,$3C,$91,$FF
+  db $74,$03                                   // +15 je +1A
+  db $B0,$01
+  db $C3                                       // +19 the early RET
+  db $8B,$50,$04                               // +1A the condition
+  db $8B,$4A,$04
+  db $8B,$D1
+  db $85,$D2
+  db $74,$03
+  db $8B,$52,$FC
+  db $8B,$48,$08
+  db $4A
+  db $3B,$CA
+  db $7C,$D1                                   // +2F jl -> back to +02
+  db $33,$C0
+  db $C3
+  db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
+end;
+
+// The refusal must not catch every function of that layout. Returns 16.
+function EarlyRetLoopBeyondPatch: Integer;
+asm
+        mov     eax, $11111111     // +0,  5 bytes
+        mov     eax, $22222222     // +5,  5 bytes
+        mov     eax, $33333333     // +10, 5 bytes
+        xor     eax, eax           // +15
+@@head:                            // +17 <- beyond the patch
+        inc     eax
+        cmp     eax, 16
+        jne     @@next
+        ret                        // early RET, before the back branch
+@@next:
+        jmp     @@head
+        db $90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90,$90
+end;
+
 // The imported routine an import thunk would forward to.
 function ThunkTarget: Integer;
 begin
@@ -548,6 +607,25 @@ begin
   Assert.IsNull(InterceptCreate(@ShortJmpIntoOwnBody, @DummyInt),
     'GetRoot followed the entry JMP into the function body - the hook then ' +
     'sits inside the loop and is entered once per iteration for a single return');
+end;
+
+procedure TPatchAreaTests.LoopBehindEarlyRet_IsRefused;
+begin
+  Assert.IsNull(InterceptCreate(@LoopBehindEarlyRet, @DummyInt),
+    'the branch back into the patch sits behind a RET the scan stopped at');
+end;
+
+procedure TPatchAreaTests.EarlyRetLoopBeyondPatch_IsHooked;
+var
+  tr: Pointer;
+begin
+  tr := InterceptCreate(@EarlyRetLoopBeyondPatch, @DummyInt);
+  Assert.IsTrue(tr <> nil, 'refused a target whose loop is past the patch');
+  try
+    Assert.AreEqual(16, TIntFunc(tr)(), 'relocated prologue misbehaves');
+  finally
+    InterceptRemove(tr);
+  end;
 end;
 
 { TImportThunkTests }

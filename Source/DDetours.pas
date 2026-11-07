@@ -2364,10 +2364,22 @@ end;
   on the second iteration, far away from the hook and impossible to attribute.
   Relocation cannot repair this - the only correct answer is to refuse.
 
-  Best effort scan: walk instructions until the first RET (functions with a
-  branch into their own prologue always close it well before that) or until a
-  decode failure. Only relative branches count; an absolute or indirect one
-  cannot be resolved statically and is left alone.
+  Best effort scan: walk instructions until a RET that no earlier forward branch
+  jumps past, or until a decode failure. The first RET alone is not the end: a
+  while loop with an Exit in its body has its RET before the branch back to the
+  loop head, e.g. TDictionary<K,V>.TValueEnumerator.MoveNext in Win32:
+
+      jmp  @cond                 ; +0
+      inc  dword ptr [eax+8]     ; +2   <- loop target
+      ...
+      mov  al, 1
+      ret                        ; the Exit
+    @cond:
+      ...
+      jl   -47                   ; back to +2
+
+  Only relative branches count; an absolute or indirect one cannot be resolved
+  statically and is left alone.
 }
 function BranchIntoPatchArea(P: PByte; PatchSize: Byte): Integer;
 const
@@ -2376,8 +2388,10 @@ var
   Inst: TInstruction;
   Scanned, Sz: Integer;
   Target: PByte;
+  FarTarget: NativeUInt;
 begin
   Result := -1;
+  FarTarget := 0;
   FillChar(Inst, SizeOf(TInstruction), #00);
   Inst.Archi := CPUX;
   Inst.NextInst := P;
@@ -2411,9 +2425,13 @@ begin
         Result := Integer(NativeInt(Target) - NativeInt(P));
         Exit;
       end;
+      { A CALL leaves the function, and a target out of scan range is a tail call. }
+      if (Inst.OpType <> otCALL) and (NativeUInt(Target) > FarTarget) and
+         (NativeUInt(Target) < NativeUInt(P) + kMaxScan) then
+        FarTarget := NativeUInt(Target);
     end;
 
-    if Inst.OpType = otRET then
+    if (Inst.OpType = otRET) and (NativeUInt(Inst.NextInst) > FarTarget) then
       Break;
   end;
   finally
